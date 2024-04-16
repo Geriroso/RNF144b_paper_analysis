@@ -1,0 +1,3341 @@
+---
+title: "RNF144b_Analysis_Report"
+author:
+- name: "Gerard Romero Sola"
+  affiliation: Cancer Biology Unit - Ana Janic's Lab
+  email: gerard.romero02@estudiant.upf.edu
+date: "`r Sys.Date()`"
+output:
+   BiocStyle::html_document:
+      toc: true
+      toc_float:
+        collapsed: true
+        smooth_scroll: true
+      toc_depth: 3
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      fig_captions: yes
+      theme: lumen
+      self_contained: true
+   fig_width: 10
+   fig_height: 10
+bibliography: bibliography.bib
+---
+
+```{css, include=FALSE}
+body {
+  text-align: justify;
+}
+```
+
+```{r setup, echo=FALSE, cache=FALSE}
+suppressPackageStartupMessages(library(knitr)) ## kable()
+knitr::opts_chunk$set(
+  collapse=TRUE,
+  comment="",
+  fig.align="center",
+  cache=FALSE
+)
+options(usethis.quiet=TRUE)
+```
+
+## Loading the packages
+
+```{r load-libraries, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(cancerTiming))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(mixOmics))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(dendextend))
+suppressPackageStartupMessages(library(sva))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(EnhancedVolcano))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(org.Mm.eg.db))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(AnnotationDbi))
+suppressPackageStartupMessages(library(pathview))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(vsn))
+suppressPackageStartupMessages(library(hexbin))
+suppressPackageStartupMessages(library(apeglm))
+suppressPackageStartupMessages(library(VennDiagram))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(survminer))
+suppressPackageStartupMessages(library(survival))
+```
+
+# Introduction 
+
+Intro about RNF144b.
+
+* Background from A. Janic (2019) DNA repair processes are critical mediators of p53-dependent tumor suppression.
+
+## Objective
+
+## Questions 
+
+## Dataset description
+
+In this first part, I am going to carry out the quality assessment of the data by means of exploratory analysis techniques. To achieve this objective, I will apply techniques like normalization, filtration and representation on several graphs of the data. Moreover, I will apply the so-called design of experiment and analyse the possible batch effect that could exist in the data. I have information lacking from the process of data processing and more details regarding the data, thus, it would be important to acquire that info in order to study possible sources of batch effect.
+
+# Transcriptomic analysis
+
+## Data import and cleaning
+
+The information for this analysis is stored in different files. First, we start by collecting the data in a unique data set and then we will build a `SummarizedExperiment` object to ease the analysis process. 
+
+**First remark**
+The data comes from the `*ReadsPerGene.out.tab`. This file is a default output file from the STAR pipeline. It contains three different columns with the counts per gene, each corresponding to a different stranding parameter:
+
+* Column 1: gene ID
+
+* Column 2: counts for unstranded RNA-seq
+
+* Column 3: counts for the 1st read strand aligned with RNA (htseq-count option -s yes)
+
+* Column 4: counts for the 2nd read strand aligned with RNA (htseq-count option -s reverse)
+
+After discussion with Etna we have determined that the experiment has no apparent stranded focus, that is why the second column will be used for the downstream analysis. The files `*ReadsPerGene_counts.txt` contain the first and forth columns from the previous mentioned file. Since the analysis has no stranding focus, we will rearrange the data from the `*ReadsPerGene.out.tab` files.
+
+```{r data}
+## Data loading
+### Create a data frame with the names of the files
+raw.files <- data.frame(filename = list.files(path = here("analysis","data","raw_data","transcriptomics"), pattern = "*ReadsPerGene.out.tab"))
+
+### Add the file paths of the files
+raw.file.paths <- raw.files %>%
+  mutate(filepath = paste0(here("analysis","data","raw_data","transcriptomics"),"/", filename))
+
+### Iterate through the files
+for (val in raw.file.paths$filepath){
+  tmp_frame <- read.delim(file = val, header = FALSE, sep = "\t") ## Open each file
+  tmp_frame <- data.frame(tmp_frame[-c(1:4), c(1,4)]) ## Remove the first four rows that correspond to sequencing parameters, not corresponding to row counts and just the column with unstrained data
+  colnames(tmp_frame) <- c("ID", (gsub(".*\\/(.*)R.*","\\1", val))) ## Name each data frame with the corresponding sample name
+  ## Now, create the data frame merging the columns with the counts of the different files
+  if (!exists("raw.data.tmp")){
+    raw.data.tmp <- tmp_frame
+  }else{
+    raw.data.tmp <- merge(raw.data.tmp, tmp_frame, by = "ID")
+  }
+}
+raw.data <- raw.data.tmp
+rm(raw.data.tmp)
+rownames(raw.data) <- raw.data[,"ID"] ## Name rows with the identifiers
+raw.data <- raw.data[,-1] ## Remove ID column
+write_delim(raw.data[,4:9] %>% rownames_to_column("Ensembl_ID") %>% mutate(Ensembl_ID = gsub("\\..*","",Ensembl_ID)),file = here("analysis","data","derived_data","transcriptomics","raw_counts_matrix.txt"),delim = "\t",)
+```
+
+### Creating the SummarizedExperiment object
+
+In order to create the `SummarizedExperiment` object we have included some data regarding the experiment. After discussion with Etna, we considered some relevant data from the parameters used in both experimental and sequencing processes, in order to check for possible sources of batch effect and so on. However, we did not find much possible sources of variation.
+
+```{r SummarizedExperiment}
+## Creating the data from the phenotypic data
+pdata <- data.frame(
+  SampleName = c("shp531", "shp532", "shp533", "shREN1", "shREN2", "shREN3", "shRNF1", "shRNF2", "shRNF3"),
+  Run = c("shp531", "shp532", "shp533", "shREN1", "shREN2", "shREN3", "shRNF1", "shRNF2", "shRNF3"),
+  RNA_concentration = as.factor(c("200", "200", "200", "200", "300", "200", "300", "200", "300")),
+  Replicate = as.factor(rep(c(1,2,3), 3)),
+  FACS_collection = as.factor(rep(c("Day1", "Day1", "Day2"),3)),
+  Vector = as.factor(c(rep("p53", 3), rep("REN", 3), rep("RNF", 3)))
+)
+
+## Creating the counts
+counts <- raw.data
+counts <- t(counts)
+pdata <- column_to_rownames(pdata, "Run")
+
+## SummarizedExperiment object
+se <- SummarizedExperiment(t(counts), colData = pdata)
+
+## Ordering the levels of the important variable
+se$Vector <- relevel(se$Vector, "REN")
+se
+```
+
+**Note**
+I have created some extra phenotypic data regarding the RNA_concentration and other parameters:
+
+* RNA_concentration: We divide the samples between 2 groups. Some of them have a concentration raging between 258 and 297 below 300 and other above 300 raging between 352 and 373. We divide them between 200 and 300 to see possible differences, being 200 the first range and 300 the second. However, we must take into account the fact that we have just 9 samples, thus, a random distribution of these samples is expected, no clustering, but since there are very few, careful of misinterpretation. Actually, we expect they cluster by Vector more than any other variable. 
+
+* We could have included the purity (260/280 and 260/230), however, the differences are so minimal that there is no sense in including it, at least, for the batch analysis. 
+
+* We will also study the batch effect regarding the replica number, which may give an indication of the variance produced by doing the experiments in different days. We guess this may suppose a source of variation, however, not as much as the Vector.
+
+* FACS_collection: The third replica was measured in the FACS another day, so, we will investigate if this supposed any source of variation, but it was a matter of just 1 day. However, in case this variable is causing any batch effect, we won't be able to distinguish between it and the replicate number, since both affect only the third replicate.
+
+Now we have created the `SummarizedExperiment` object. We will add some parameters for the downstream analysis. We will do a little trick with the identifiers. The identifiers correspond to the `ENSEMBL_ID_VARIANT?`; or at least they have the same format. For instance, this identifier has the following format: `ENSMUSG00000000001.4`. This type of identifier is hard to map with other formats, for that reason, we will remove the number after the dot to obtain the `ENSEMBL_ID`. This way, the process of mapping will be eased. We have tried to map the identifiers, without great success (I obtain many NAs due to a lack of mapping) with both `org.Mm.eg.db` and `biomaRt` packages. The second one has given better results. Since it is not crucial to obtain the identifiers at the moment, I will go on with the analysis and do the mapping in posterior steps. Furthermore, we did this trick, but confirmed that is not affecting the results, by checking there are no duplicates when removing the number after the dot, as shown in the code below.
+
+```{r no-duplicates}
+## Removing the numbers after the dots
+gene_ids <- rownames(raw.data)
+id_nodot <- gsub("\\..*","",gene_ids)
+paste0("The number of duplicated identifiers are ", sum(duplicated(id_nodot)))
+```
+
+Now, we add this column to the `SummarizedExperiment` object and do other modifications for the analysis, like naming the assays of the `SummarizedExperiment` object as "counts" to identify and ease the accession.
+
+```{r SummarizedExperiment2}
+## Add names to rowData
+rowData(se)$ensembl_id <- id_nodot
+## Name the assays element as "counts"
+names(assays(se)) <- c("counts")
+```
+
+### Annotating the genes with different annotations
+
+In this section, we will try to annotate the genes with different packages in order to have the genes named with different types of annotations. From a previous experience I noticed these annotation ways are not perfect and retrieve a lot of NAs. So, I will try different methods and with the remaining NAs, I will name them as missing values. Luckily, I already have a unique annotation for each gene with the ENSEMBL ID, thus, (spoiler) I won't make use of these type of annotation that much.
+The first approach which gave me the best results in terms of less NAs consists of an online (tool)[https://www.biotools.fr/mouse/ensembl_symbol_converter] that seems to work pretty fine.
+
+```{r anno-biotools}
+write.table(as.data.frame(rowData(se)$ensembl_id), file = here("analysis","data","derived_data","transcriptomics","extdata", "gene_ids", "List_of_ENSEMBL_ID_raw_data.txt"), row.names = FALSE, col.names = FALSE, quote = FALSE, sep = "\t")
+ENSEMBL_to_SYMBOL <-read.delim(here("analysis","data","derived_data","transcriptomics","extdata", "gene_ids", "Ensembl_to_symbol_biotools_web.txt"), header = FALSE, sep = "\t")
+ENSEMBL_to_SYMBOL$V2[ENSEMBL_to_SYMBOL$V2 == ""] <- NA
+rowData(se)$mgi_symbol <- ENSEMBL_to_SYMBOL$V2
+list_missing_tool <- ENSEMBL_to_SYMBOL$V1[is.na(ENSEMBL_to_SYMBOL$V2)]
+```
+
+From the remaining not annotated genes I'll try to map them with `biomaRt` or `org.Mm.eg.db`. I just use `biomaRt` first, since it has proven to provide better results.
+```{r anno-biomaRt, warning=FALSE, message=FALSE}
+ensembl <- useMart('ensembl', dataset = 'mmusculus_gene_ensembl')
+
+annot <- getBM(
+  attributes = c(
+    'mgi_symbol',
+    'ensembl_gene_id'),
+  filters = 'ensembl_gene_id',
+  values = list_missing_tool,
+  mart = ensembl)
+annot$mgi_symbol[annot$mgi_symbol == ""] <- NA
+second_list_missing <- annot$ensembl_gene_id[is.na(annot$mgi_symbol)]
+```
+
+After finding more annotations with `biomaRt` I could use the non annotated ones and try to map them to the `org.Mm.eg.db` and merge them all at once. However, I realized that `biomaRt` is removing some of the genes, maybe because they are no more on the db or whatever. For this reason, I'll first merge, obtain the still not annotated genes and try to map them the other package. 
+```{r anno-merging}
+merged <- merge.data.frame(rowData(se), annot, by.x = "ensembl_id", by.y = "ensembl_gene_id", all.x = TRUE)
+merged$mgi_symbol <- coalesce(merged$mgi_symbol.x, merged$mgi_symbol.y)
+merged <- merged[, c("ensembl_id", "mgi_symbol")]
+after.merging.nas <- merged$ensembl_id[is.na(merged$mgi_symbol)]
+```
+
+```{r anno-org.Mm.eg.db, warning=FALSE, message=FALSE}
+values.org.missing <- as.data.frame(mapIds(x = org.Mm.eg.db, keys = after.merging.nas, column = "SYMBOL", keytype = "ENSEMBL"))
+colnames(values.org.missing) <- c("mgi_symbol")
+sum(is.na(values.org.missing$mgi_symbol))
+values.org.missing <- values.org.missing %>%
+  mutate(ensembl_id = rownames(values.org.missing), .before=mgi_symbol)
+values.org.missing$mgi_symbol <- coalesce(values.org.missing$mgi_symbol, paste0("missing",1:44)) #Should be increasing just taking into account the missing values, however, this does the trick
+merged2 <- merge.data.frame(merged, values.org.missing, by.x = "ensembl_id", by.y = "ensembl_id", all.x = TRUE)
+merged2$mgi_symbol <- coalesce(merged2$mgi_symbol.x, merged2$mgi_symbol.y)
+rowData(se)$mgi_symbol <- merged2$mgi_symbol
+```
+
+### Description of the dataset
+
+
+Once I have created the object, let's do some description. We have `r nrow(se)` genes by `r ncol(se)` samples. 
+
+The row data in this object contains the ENSEMBL_ID about the profiled genes. We can get a little closer to it inspecting its first 6 rows:
+
+```{r description1}
+head(rowData(se))
+```
+
+Let's explore now the column (phenotypic) data:
+
+```{r description2}
+colData(se)
+```
+
+We have only `r ncol(colData(se))` phenotypic variables, and the first one contains just the names of the samples, which is a bit redundant with the rownames of the phenotypic data. I am planning to include more data on this data set, regarding both the sequencing and experimental processes. 
+
+The second column `Vector` was arbitrarily named (it should be changed) and contains the type of sample for each of the samples. There are three possible groups:
+
+* p53: It corresponds to the positive control, but also to a condition of interest and it consisted of cells with shRNA targeting p53
+
+* REN: It corresponds to the negative control and it consisted of cells with shRNA targeting a luciferase (I have to confirm this further)
+
+* RNF: It corresponds to the condition of interest and it consisted of cells with shRNA targeting the RNF144b protein
+
+```{r description3}
+table(colData(se)$Vector)
+```
+
+From what Etna explained me, the three samples in each condition correspond to biological replicates and not technical replicates. This means that within the different conditions, the measurements come from different samples and not the exact same sample. Thus, the variability within the replicates will be higher than if they would have been from the same sample.
+
+Therefore, we have 9 unique different individuals samples and there is no technical replicates for any of them. We have 3 replicates for each condition. Multiple differential expession analysis methodologies will be explored. However, they will not be presented in this report, since it would be endless. For that reason, we will only include the selected methodology providing the best results and some comparisons results when selecting the optimal methodology.
+
+To proceed further exploring this dataset, we are going to use the [edgeR](https://bioconductor.org/packages/edgeR) package (one of the most widely used pipelines for quality assessment and normalization of RNA-seq data) and build a `DGEList` object. Now, in order to avoid the presence of NAs, I will not include any other naming format to the object. However, it would be suitable to add in this object the gene symbols, or in the case of mice, the mgi_symbol and maybe, the Entrez ID.
+
+In addition to this object, I will create a `DESeqDataSet` object in order to proceed with further analysis that will be done following the DESeq2 package to compare the different methodologies.
+
+```{r DEAobjects}
+## Create the DGEList object
+dge <- DGEList(counts=assays(se)$counts, genes=rowData(se), group = colData(se)$Vector)
+dge$samples$RNA_concentration <- colData(se)$RNA_concentration
+dge$samples$Replicate <- colData(se)$Replicate
+dge$samples$FACS <- colData(se)$FACS_collection
+dim(dge)
+
+## Create a DESeqDataSet object
+dds <- DESeqDataSet(se, ~Vector)
+dds
+```
+
+## Data pre-processing and quality assessment
+
+### Transformations from the raw-scale
+
+For differential expression and related analyses, gene expression is rarely considered at the level of raw counts since libraries sequenced at a greater depth will result in higher counts. Rather, it is common practice to transform raw counts onto a scale that accounts for such library size differences. 
+
+In this type of analyses, CPM and log-CPM transformations are used regularly although they do not account for gene length differences as RPKM and FPKM values do. Whilst RPKM and FPKM values can just as well be used, CPM and log-CPM values can be calculated using a counts matrix alone and will suffice for the type of comparisons we are interested in. Assuming that there are no differences in isoform usage between conditions, differential expression analyses look at gene expression changes between conditions rather than comparing expression across multiple genes or drawing conclusions on absolute levels of expression. In other words, gene lengths remain constant for comparisons of interest and any observed differences are a result of changes in condition rather than changes in gene length.
+
+In this context, the edgeR manual suggests only to normalize necessarily for sample-specific effects, the other types of normalizations are not necessary since the type of analysis assumes constant parameters such as gene length or GC content between conditions. edgeR is concerned with differential expression analysis rather than with the quantification of expression levels. It is concerned with relative changes in expression levels between conditions, but not directly with estimating absolute expression levels. This greatly simplifies the technical influences that need to be taken into account, because any technical factor that is unrelated to the experimental conditions should cancel out of any differential expression analysis. For example, read counts can generally be expected to be proportional to length as well as to expression for any transcript, but edgeR does not generally need to adjust for gene length because gene length has the same relative influence on the read counts for each RNA sample. For this reason, normalization issues arise only to the extent that technical factors have sample-specific effects.
+
+To calculate $\log_2$ CPM units of expression we will use the function `cpm()` implemented in `edgeR`. When `log=TRUE`, the `cpm()` function adds an offset to the CPM values before converting to the log2-scale. By default, the offset is 2/L where 2 is the “prior count” and L is the average library size in millions, so the log-CPM values are related to the CPM values by log2(CPM + 2/L). This calculation ensures that any two read counts with identical CPM values will also have identical log-CPM values. The prior count avoids taking the logarithm of zero, and also reduces spurious variability for genes with very low counts by shrinking all the inter-sample log-fold-changes towards zero, something that is helpful for exploratory plotting. For this dataset, the average library size is about 43 million, so L approx. 43 and the minimum log-CPM value for each sample becomes log2(2/43) = -4.43. In summary, doing a log2 of the CPM values would not give the same results, thus, it is suggested to use this kind of log transformation within the function.
+
+In terms of what the CPM values show: A CPM value of 1 for a gene equates to having 20 counts in the sample with a library size approx. 20 million or 76 counts in the a sample of library size approx. 76 million.
+
+```{r cpm-transform}
+assays(se)$logCPM <- cpm(dge, log=TRUE)
+summary(assays(se)$logCPM)
+```
+
+As we can see, all the min values correspond to the value we previously mentioned, -4.43, since all samples contain one gene with 0 expression. We will use this log-CPM normalization in order to do the filtering, however, this transformation is not suggested for the downstream analysis since it is only accounting for sequencing depth and not for sample-specific effects.
+
+## Sequencing depth
+
+Let's examine the sequencing depth in terms of total number of sequence read counts mapped to the genome per sample.
+
+```{r description4}
+head(dge$samples)
+dge$samples$group
+```
+
+```{r libsizes, echo=FALSE, fig.height=10, fig.width=10, out.width="600px", fig.cap="Library sizes in increasing order."}
+ord <- order(dge$sample$lib.size)
+barplot(dge$sample$lib.size[ord]/1e6, las=1, ylim = c(0,50),ylab="Millions of reads",
+        xlab="Samples", col=c("#B24745FF", "#79AF97FF", "#E5D29F")[se$Vector[ord]])
+legend("topleft", c("p53", "REN", "RNF"), fill=c("#B24745FF", "#79AF97FF", "#E5D29F"), inset=0.01)
+```
+
+We find a quite uniform distribution within the samples in terms of library size. The difference between the maximum and minimum sequencing depth of the libraries is `r max(dge$samples$lib.size)-min(dge$samples$lib.size)`. This difference is minimal in comparison to the total sequencing depth of each sample, in fact, in [@libsize] they compared the effect of having huge differences in terms of library sizes between conditions. They found that differences could affect the downstream analysis in the differential expression section depending on the method used (they talked about analyzing with limma) and they used a difference of 2 million reads as a small difference in library size.
+
+If we calculate the means for the different conditions in terms of library size:
+```{r libsize_values}
+lib.size.mean.p53 <- mean(dge$samples$lib.size[se$Vector == "p53"])
+lib.size.mean.REN <- mean(dge$samples$lib.size[se$Vector == "REN"])
+lib.size.mean.RNF <- mean(dge$samples$lib.size[se$Vector == "RNF"])
+# Table here
+lib.size.mean.p53
+lib.size.mean.REN 
+lib.size.mean.RNF
+```
+
+By comparing the means between the different conditions, we see differences of less than 1 million between the maximum and the minimum, which makes even more uniform the distribution of library sizes between conditions, thus, sequencing depth is likely a non important source of variation.
+
+## Distribution of expression levels among samples
+
+In this step, I am going to show the distribution of expression levels, adjusting the sample to compare features across them. For getting this purpose we will use the sample values in logarithmic CPM units of expression. In this case, we need no more specific normalization than a sequencing depth normalization.
+
+```{r distRawExp, echo=FALSE, fig.height=5, fig.width=10, out.width="600px", fig.cap="Non-parametric density distribution of expression profiles per sample.", message=FALSE}
+par(mfrow=c(1, 2), mar=c(8, 5, 0, 0))
+lst <- as.list(as.data.frame(assays(se)$logCPM))
+multidensity(lst, xlab="log 2 CPM", legend=NULL, main="", las=1, cex.axis=1.2, cex.lab=1.5)
+boxplot(assays(se)$logCPM, col="gray", xlab="", ylab=expression(log[2] * "CPM"),
+        cex.axis=1.2, cex.lab=1.5, las=2)
+```
+
+Figure \@ref(fig:distRawExp) shows the distribution of expression values per sample in logarithmic CPM units of expression. It shows a bimodal distribution of expression levels, where there is a group of low-expressed genes and a group of high-expressed genes. In addition, I can see no substantial differences between the distribution across samples. I see that the boxplots have a very low median, which means there is a HUUUUUUUUGE amount of lowly-expressed genes, thus, the boxplots are absolutely biased towards lowly expressed genes. This is corrected in the filtering step.
+
+## Distribution of expression levels among genes
+
+In this second plot, we represent the expression levels among genes by taking the mean of expression (transformed in log-CPM) of each gene among all the samples. The distribution of expression levels among samples has allowed to identify lowly expressed genes. Therefore, let's calculate now the average expression per gene through all the samples.
+
+```{r exprdist, echo=FALSE, out.width="600px", fig.cap="Distribution of average expression level per gene."}
+avgexp <- rowMeans(assays(se)$logCPM)
+hist(avgexp, xlab="log2 CPM", main="", las=1, col= "#39568CFF")
+```
+
+Figure \@ref(fig:exprdist) shows the distribution of those values across genes. The peak at lowly expressed genes is immense. As expected, **two modes** are observed, one for genes that are lowly expressed and another for genes with some detectable levels of expression. In general, the same distribution is seen among samples. Moreover, the second group seems to have a normally distributed set of values. The filtering of those genes is performed in the following section.
+
+## MA-plots
+
+We will see the distribution of the data with an MA-plot to see the differences obtained before and after the filtering and normalization. The first one shows the distribution of the data of p53 vs REN and the second of RNF vs REN.
+
+```{r MANoNormP53vsREN}
+plotSmear(dge, lowess=TRUE, las=1, cex.lab=1.5, cex.axis=1.2)
+abline(h=0, col="blue", lwd=2)
+```
+
+```{r MANoNormRNFvsREN}
+plotSmear(dge[,dge$samples$group != "p53"], lowess=TRUE, las=1, cex.lab=1.5, cex.axis=1.2)
+abline(h=0, col="blue", lwd=2)
+```
+
+We observe that both plots have a bias in the data: large fold changes tend to occur at low expression levels. This feature is considered as an artifact and it is represented in the orange color. This artifact is caused by the discreteness of counts at low values, where ratios between low numbers may easy lead to large fold-changes. In general, fold-changes from large expression values are more reliable than those coming from low-expression values. A way to deal with the artifact is to discard genes with average low expression values across samples, or that are lowly expressed in a given number of samples.
+
+## Filtering of lowly-expressed genes
+
+All datasets will include a mix of genes that are expressed and those that are not expressed. Whilst it is of interest to examine genes that are expressed in one condition but not in another, some genes are unexpressed throughout all samples. RNA-seq expression profiles from lowly-expressed genes can lead to artifacts in downstream differential expression analyses.
+
+Genes that do not have a worthwhile number of reads in any sample should be filtered out of the downstream analyses. There are several reasons for this. From a biological point of view, genes that are not expressed at a biologically meaningful level in any condition are not of interest and are therefore best ignored, a gene must be expressed at some minimal level before it is likely to be translated into a protein or to be biologically important. From a statistical point of view, removing low count genes allows the mean-variance relationship in the data to be estimated with greater reliability and also reduces the number of statistical tests that need to be carried out in downstream analyses looking at differential expression.
+
+As a rule of thumb, genes are dropped if they can’t possibly be expressed in all the samples for any of the conditions. Users can set their own definition of genes being expressed. Usually a gene is required to have a count of 5-10 in a library to be considered expressed in that library. Users should also filter with count-per-million (CPM) rather than filtering on the counts directly, as the latter does not account for differences in library sizes between samples.
+
+The `filterByExpr()` function in the edgeR package provides an automatic way to filter genes, while keeping as many genes as possible with worthwhile counts. Furthermore, it takes into account differences in library sizes between samples and the fact that there is a expression in a minimum number of samples.
+
+I used the function `filterByExpr()`, grouping by Vector to define a minimum count reads (`min.count`) in *n* samples. In this case, the filtering keep genes that have CPM above 20 count in at least the 95% of the samples.
+
+```{r filterLowExpr}
+mask <- filterByExpr(dge, group=se$Vector, min.count=20, min.prop=0.95)
+se.filt <- se[mask, ]
+dge.filt <- dge[mask,, keep.lib.sizes = FALSE]
+dim(se.filt)
+```
+
+By default, the function keeps genes with about 10 read counts or more in a minimum number of samples, where the number of samples is chosen according to the minimum group sample size. The actual filtering uses **CPM** values rather than counts in order to avoid giving preference to samples with large library sizes. For this dataset, the median library size is about 43 million and 10/43 approx. 0.23, so the filterByExpr function keeps genes that have a CPM of 0.23 or more in at least three samples. A biologically interesting gene should be expressed in at least three samples because all the condition groups have three replicates. The cutoffs used depend on the sequencing depth and on the experimental design. If the library sizes had been larger then a lower CPM cutoff would have been chosen, because larger library sizes provide better resolution to explore more genes at lower expression levels. Alternatively, smaller library sizes decrease our ability to explore marginal genes and hence would have led to a higher CPM cutoff.
+
+Applying this first filter, we are left with `r nrow(se.filt)` genes, about 27% of the number that we started with.
+
+```{r filt, echo=FALSE, out.width="600px", fig.cap="Distribution of average expression level per gene. Yellow bars show distribution of genes passing the first filter.", fig.height=10, fig.width=15}
+par(mar=c(4, 5, 1, 1))
+h <- hist(avgexp, xlab=expression("Expression level (" * log[2] * "CPM)"), ylab = "Frequency",
+                    main="", las=1, col="#39568CFF", cex.axis=0.9, cex.lab=1)
+x <- cut(rowMeans(assays(se.filt)$logCPM), breaks=h$breaks)
+lines(h$mids, table(x), type="h", lwd=10, lend=1, col="yellow2")
+legend("topright", c("All genes", "Filtered genes"), fill=c("#39568CFF", "yellow2"))
+```
+
+```{r densityfiltervsnofilter, fig.width=15, fig.height=15}
+L <- mean(dge$samples$lib.size) * 1e-6
+M <- median(dge$samples$lib.size) * 1e-6
+lcpm.cutoff <- log2(20/M + 2/L)
+lcpm <- cpm(dge, log=TRUE)
+library(RColorBrewer)
+nsamples <- ncol(dge)
+col <- brewer.pal(nsamples, "Paired")
+par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.8), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+lcpm <- cpm(dge.filt, log=TRUE)
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.8), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+```
+
+A comparison was conducted applying different filters:
+
+* Selected one: the filter keeps the genes that have CPM above 20 counts in at least the 95% of the samples
+
+* Most permissive: the filter keeps the genes that have CPM above 10 counts in at least the 95% of the samples
+
+* Most restrictive: the filter of genes below a minimum average CPM value of 1 throughout the samples
+
+\@ref(fig:filt) shows the distribution of gene expression after applying the filter of the selected approach.
+I think the most convenient filter would be the one that is giving the middle value. We are raging 2000 in comparison with the most and less restrictive approaches. The first and second apply appropriate cutoffs on a per-group basis, the third approach simply cuts the values over 1 cpm expression level. In addition, the firsts two filters keep more genes being more flexible filters that will, perhaps, conduct us to a higher proportion of false positives, so from those I selected the more restrictive. In general, the more the genes that are tested, the larger multiple testing correction is needed and therefore, less statistical power is achieved. However, we can explore more genes that otherwise would have been removed.
+
+## Normalization
+
+Now, that I have our data filtered, I will apply a between-sample normalization. During the sample preparation or sequencing process, external factors that are not of biological interest can affect the expression of individual samples. For example, samples processed in the first batch of an experiment can have higher expression overall when compared to samples processed in a second batch. It is assumed that all samples should have a similar range and distribution of expression values. Normalization is required to ensure that the expression distributions of each sample are similar across the entire experiment.
+
+Any plot showing the per sample expression distributions, such as a density or boxplot, is useful in determining whether any samples are dissimilar to others. Distributions of log-CPM values are similar throughout all samples within this dataset (panel B of the figure above).
+
+Nonetheless, normalization by the method of trimmed mean of M-values (TMM) (Robinson and Oshlack 2010) is performed using the `calcNormFactors()` function in edgeR. The normalization factors calculated here are used as a scaling factor for the library sizes. When working with DGEList-objects, these normalization factors are automatically stored in x$samples$norm.factors. For this dataset the effect of TMM-normalization is mild, as evident in the magnitude of the scaling factors, which are all relatively close to 1.
+
+```{r}
+dge.filt <- calcNormFactors(dge.filt, method = "TMM")
+head(dge.filt$samples$norm.factors)
+```
+
+Consequently, I will replace the raw log2 CPM units in the corresponding assay element of the `SummarizedExperiment` object, by the normalized ones.
+
+```{r}
+assays(se.filt)$TMM<- cpm(dge.filt, log=TRUE,
+                              normalized.lib.sizes=TRUE)
+```
+
+```{r, fig.width=10, fig.height=12}
+set.seed(999)
+TMM_matrix_DE_p53_genes = as.data.frame(assays(se.filt)$TMM) %>%
+	rownames_to_column("ID") %>%
+	mutate(ID = gsub("\\..*","",ID)) %>%
+	filter(ID %in% DEgenes.DESeq2.sva.p53) %>% 
+	column_to_rownames("ID") %>% as.matrix()
+km <- kmeans(TMM_matrix_DE_p53_genes[,1:6], centers = 6)
+km_clusters <- km$cluster
+DEG_p53_heatmap = Heatmap(TMM_matrix_DE_p53_genes[,1:6], name = "TMM norm counts", gap = unit(2, "mm"),split = km_clusters, show_row_names = FALSE)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_heatmap_p53_DEGs.pdf"), width = 10, height = 10)
+DEG_p53_heatmap
+dev.off()
+```
+
+```{r MAplotp53raw, fig.width=15}
+par(mfrow=c(1,2))
+plotSmear(dge, lowess=TRUE, las=1, cex.lab=1.5, cex.axis=1.2)
+abline(h=0, col="blue", lwd=2)
+plotSmear(dge.filt, lowess=TRUE, las=1, cex.lab=1.5, cex.axis=1.2, ylim=c(-6,6))
+abline(h=0, col="blue", lwd=2)
+```
+
+```{r MAplotRNFraw, fig.width=15}
+par(mfrow=c(1,2))
+plotSmear(dge[,dge$samples$group != "p53"], lowess=TRUE, las=1, cex.lab=1.5, cex.axis=1.2)
+abline(h=0, col="blue", lwd=2)
+plotSmear(dge.filt[,dge.filt$samples$group != "p53"], lowess=TRUE, las=1, cex.lab=1.5, cex.axis=1.2, ylim=c(-4,4))
+abline(h=0, col="blue", lwd=2)
+```
+
+### Boxplots
+
+```{r boxplotraw, fig.width=21}
+par(mfrow=c(1, 2))
+boxplot(cpm(dge,log=T,prior.count=0.25), col="gray", xlab="Samples", ylab=expression(log[2] * "CPM"), cex.axis=1.2, cex.lab=1.5, las=1)
+boxplot(cpm(dge.filt,log=T,prior.count=0.25), col="gray", xlab="Samples", ylab=expression(log[2] * "CPM"), cex.axis=1.2, cex.lab=1.5, las=1)
+```
+
+Before we did MA-plots comparing two sample groups. Here we do one sample at a time against the average of the rest of the samples.
+
+```{r maPlotssamples, fig.height=10, fig.width=10, dpi=100, echo=FALSE, fig.cap="MA-plots of filtered and normalized expression values."}
+par(mfrow=c(3, 3), mar=c(4, 5, 3, 1))
+for (i in 1:ncol(se.filt)) {
+  A <- rowMeans(assays(se.filt)$TMM)
+  M <- assays(se.filt)$TMM[, i] - A
+  smoothScatter(A, M, main=colnames(se.filt)[i], las=1)
+  abline(h=0, col="blue", lwd=2)
+  lo <- lowess(M ~ A)
+  lines(lo$x, lo$y, col="red", lwd=2)
+}
+```
+
+Now we have normalized with the TMM methodology we want to see if we find variations by the fact of normalizing by other methodologies, which is expected. We will conduct to types of methodologies, both suggested in the DESeq2 workflow: RLOG and VST.
+
+DESeq2 offers two transformations for count data that stabilize the variance across the mean: the variance stabilizing transformation (VST) for negative binomial data with a dispersion-mean trend (Anders and Huber 2010), implemented in the vst function, and the regularized-logarithm transformation or rlog (Love, Huber, and Anders 2014).
+
+For genes with high counts, both the VST and the rlog will give similar result to the ordinary log2 transformation of normalized counts. For genes with lower counts, however, the values are shrunken towards a middle value. The VST or rlog-transformed data then become approximately homoskedastic (more flat trend in the meanSdPlot), and can be used directly for computing distances between samples, making PCA plots, or as input to downstream methods which perform best with homoskedastic data.
+
+Which transformation to choose? The VST is much faster to compute and is less sensitive to high count outliers than the rlog. The rlog tends to work well on small datasets (n < 30), potentially outperforming the VST when there is a wide range of sequencing depth across samples (an order of magnitude difference). We therefore recommend the VST for medium-to-large datasets (n > 30). You can perform both transformations and compare the meanSdPlot or PCA plots generated, as described below.
+
+Note that the two transformations offered by DESeq2 are provided for applications other than differential testing. For differential testing we recommend the DESeq function applied to raw counts, as described later in this workflow, which also takes into account the dependence of the variance of counts on the mean value during the dispersion estimation step.
+
+**Rlog**
+
+```{r}
+## Create a DESeqDataSet object
+dds.filt <- DESeqDataSet(se.filt, ~Vector)
+dds.filt
+# Transform counts for data visualization (unsupervised analysis)
+rld <- rlog(dds.filt, blind=TRUE)
+# Generate matrix of transformed counts
+rld_mat <- assay(rld)
+
+meanSdPlot(rld_mat, ranks = FALSE)
+```
+
+**VST**
+
+```{r}
+vsd <- vst(dds.filt, blind = TRUE)
+vsd_mat <- assay(vsd)
+meanSdPlot(vsd_mat, ranks = FALSE)
+```
+
+```{r}
+logTMM_pc1 <- cpm(dge.filt, log=TRUE,
+                              normalized.lib.sizes=TRUE, prior.count = 1)
+logTMM_pc3 <- cpm(dge.filt, log=TRUE,
+                              normalized.lib.sizes=TRUE, prior.count = 3)
+```
+
+
+```{r}
+par(mfrow = c(3,1))
+meanSdPlot(logTMM_pc1, ranks = FALSE)
+meanSdPlot(assays(se.filt)$TMM, ranks = FALSE)
+meanSdPlot(logTMM_pc3, ranks = FALSE)
+```
+
+```{r}
+resrawpca <- pca(t(assays(se.filt)$counts), ncomp = 5)
+plot(resrawpca)
+plotIndiv(resrawpca)
+
+resTMMpca <- pca(t(assays(se.filt)$TMM), ncomp = 5)
+plot(resTMMpca)
+plotIndiv(resTMMpca)
+```
+
+#### Plot heatmap
+
+```{r}
+rld_cor <- cor(rld_mat)
+pheatmap(rld_cor, annotation = pdata)
+```
+
+## Experimental design and batch identification
+
+In this section, we will explore the underlying experimental design and we will try to identify possible sources of batch effect.
+
+The first step consists in analyzing the sample information from our SummarizedExperiment object. I included some variables that, even though they may not have any effect at all or that is what I expect, I will analyze them either way.
+
+For this reason, I will try to find possible unwanted variability by examining our outcomes of interest.
+
+First, I will examine how samples group together by hierarchical clustering and multidimensional scaling with every suspicious variable. 
+
+```{r sampleClusteringVector, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Hierarchical clustering of the samples. Labels correspond to treatment and sample identifer, while colors indicate sample genotype"}
+logCPM <- cpm(dge.filt, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.integer(se.filt$Vector)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$Vector, colnames(se), sep="\n")
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+                               function(x, batch, labels) {
+                                 if (is.leaf(x)) {
+                                   attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x, "label")]))
+                                   attr(x, "label") <- as.vector(labels[attr(x, "label")])
+                                 }
+                                 x
+                               }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples",
+     cex=0.7)
+legend("topright", levels(se.filt$Vector),
+       fill=seq_len(nlevels(se.filt$Vector)))
+```
+
+```{r mdsPlotVector, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Multidimensional scaling plot of the samples. Labels correspond to treatment and colors indicate sample genotype"}
+outcome <- se.filt$Vector
+names(outcome) <- colnames(se.filt)
+plotMDS(dge.filt, labels=outcome, col=batch)
+legend("bottomleft", levels(se.filt$Vector),
+       fill=seq_len(nlevels(se.filt$Vector)), inset=0.05)
+```
+
+```{r mdsPlotVectornop53vst, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Multidimensional scaling plot of the samples. Labels correspond to treatment and colors indicate sample genotype"}
+nop53dds <- dds.filt[, dds.filt$Vector != "p53"]
+nop53dds$Vector <- droplevels(nop53dds$Vector)
+batch <- as.integer(nop53dds$Vector)
+vsdnop53 <- vst(nop53dds, blind = TRUE)
+vsd_mat_nop53 <- assay(vsdnop53)
+outcome <- nop53dds$SampleName
+names(outcome) <- colnames(nop53dds)
+plotMDS(vsd_mat_nop53, labels=outcome, col=batch)
+legend("bottomright", levels(nop53dds$Vector),
+       fill=seq_len(nlevels(nop53dds$Vector)), inset=0.05)
+```
+
+```{r mdsPlotVectornop53rlog, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Multidimensional scaling plot of the samples. Labels correspond to treatment and colors indicate sample genotype"}
+rldnop53 <- rlog(nop53dds, blind = TRUE)
+rld_mat_nop53 <- assay(rldnop53)
+outcome <- nop53dds$SampleName
+names(outcome) <- colnames(nop53dds)
+plotMDS(rld_mat_nop53, labels=outcome, col=batch)
+legend("topright", levels(nop53dds$Vector),
+       fill=seq_len(nlevels(nop53dds$Vector)), inset=0.05)
+```
+
+```{r mdsPlotVectornop53TMM, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Multidimensional scaling plot of the samples. Labels correspond to treatment and colors indicate sample genotype"}
+nop53 <- dge.filt[,dge.filt$samples$group != "p53"]
+nop53se <- se.filt[,se.filt$Vector != "p53"]
+nop53se$Vector <- droplevels(nop53se$Vector)
+outcome <- nop53se$SampleName
+names(outcome) <- colnames(nop53se)
+plotMDS(nop53, labels=outcome, col=batch)
+legend("topright", levels(nop53se$Vector),
+       fill=seq_len(nlevels(nop53se$Vector)), inset=0.05)
+```
+
+If we conduct a PCA with the Rlog normalized data from the DESeq2 package, we obtain the following plot with the components PC1 and PC2:
+
+```{r}
+plotPCA(vsd, intgroup = "Vector")
+```
+
+We find no apparent batch effect. There is a clear difference with the third replicates in reference to the other two. However, the most notorious difference is found in the third replicate of the p53 samples. From which was commented with Savvas, they found that sample to have a poor silencing, or a higher expression of p53 compared to the other two and that might drive this differences.
+
+In order to check for this possible source of variation, we could include the variable in the model to adjust for it. However, another suggested way to remove hidden batch effects is using surrogate variables, which is suggested by no more no less than Michel Love.
+
+### Removing hidden batch effect with SVA
+
+Suppose we did not know that there were differences between replicates involved in the experiment, only that the differences between samples come from the differents vectors used. The replicates effect on the counts then would represent some hidden and unwanted variation that might be affecting many or all of the genes in the dataset. We can use statistical methods designed for RNA-seq from the sva package (Leek 2014) in Bioconductor to detect such groupings of the samples, and then we can add these to the DESeqDataSet design, in order to account for them.
+
+The SVA package uses the term surrogate variables for the estimated variables that we want to account for in our analysis.
+
+```{r}
+dds.filt <- estimateSizeFactors(dds.filt)
+dat  <- counts(dds.filt, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ Vector, colData(dds))
+mod0 <- model.matrix(~   1, colData(dds))
+svseq <- svaseq(dat, mod, mod0, n.sv = 5)
+```
+
+We find 2 significant surrogate variables. We will analyze them in a plot and we will include them in the model design:
+
+```{r}
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:5) {
+  stripchart(svseq$sv[, i] ~ dds.filt$Vector, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+ }
+```
+
+```{r}
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:5) {
+  stripchart(svseq$sv[, i] ~ dds.filt$Replicate, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+ }
+```
+
+We observe that, as expected, the surrogate variables seem to differ for the fact of being from different replicates (or being introduced in the FACS facility on different days, but that can be considered as a reason why the third replicates are different).
+
+Finally, in order to use SVA to remove any effect on the counts from our surrogate variables, we simply add these two surrogate variables as columns to the DESeqDataSet and then add them to the design:
+
+```{r}
+ddssva <- dds.filt
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+design(ddssva) <- ~ SV1 + SV2 + Vector
+```
+
+We could then produce results controlling for surrogate variables by running DESeq with the new design.
+
+**Note**
+
+There is another way to correct for this unwanted variation and it consists in the usage of the RUVSeq package. It was tested with our data and the results were much worse than the ones obtained with the SVA package. For that reason, we will go on with the SVA package. Actually, we obtained, by a huge difference, the best results by adjusting for these hidden batch effect.
+
+# Differential Expression Analysis
+
+The huge part of the analysis or, at least, the part with the highest time investment. Not happy with a predefined pipeline extracted from a recently coursed subject from the master, I decided to explore several methodologies of differential expression analysis and assessed each one of them to decide which to use.
+
+A total amount of 13 different methodologies have been applied. I will summarize the results of that in a table, with the different results in each of the fields I checked. These comparisons were conducted with the p53 dataset, which is the one that allowed us to apply different assessment methodologies. The parameters I used to assess the best methodology were:
+
+* Number of DEGs
+
+* Position of the p53 within the DEGs, ordered by padj and logFC
+
+* Raw p-values distribution
+
+* Position of the Hallmark_p53_pathway in the GSEA analysis, ordered by NES and padj
+
+* Accuracy parameters with the GSEA methodology
+
+To explain the last parameter further: I needed a way to obtain TP/FP/TN/FN. I first started using the DEGs, however, the variables were completely unbalanced and the genes considered as TP are based from few databases, so I preferred to follow another methodology. Thanks to Savvas and Athestis (sorry), I followed a more "reliable" methodology which also has unbalanced variables, but without such a big magnitude. 
+
+From a big group of gene sets (those gene sets from Hallmark and Curated sets in mouse) I build two groups of gene sets, those containing p53 and those that did not contain p53. Then, I conducted the different DEAs, followed by GSEA with the DEGs. With that, I obtained the enriched gene sets for each methodology. From that, I determined the gene sets as my evaluation unit. Then, I considered:
+
+* TP: The number of enriched gene sets that were found in the group that contained p53
+
+* FP: The number of enriched gene sets that were found in the group that did not contain p53
+
+* TN: The number of not enriched gene sets (total number of gene sets - enriched sets) that were found in the group that did not contain p53
+
+* FN: The number of not enriched gene sets that were found in the group that contained p53
+
+Establishing these values, I then computed different accuracy parameters: precision, recall, accuracy, err, Fscore, specificity & fpr. From those, the methodology with the best results was selected, and by a huge difference, it was the DESeq2 methodology with shrinkage adjusting for SVA.
+
+## p53
+
+### DESeq2 + SVA
+
+```{r}
+ddssva.p53 <- ddssva[,ddssva$Vector == "REN" | ddssva$Vector == "p53"]
+ddssva.p53$Vector <- droplevels(ddssva.p53$Vector)
+ddssva.p53$Vector <- relevel(ddssva.p53$Vector, "REN")
+```
+
+```{r}
+ddssva.DESeq.p53 <- DESeq(ddssva.p53)
+```
+
+```{r}
+tt.DESeq.sva.p53 <- results(ddssva.DESeq.p53, contrast = c("Vector", "p53", "REN"), alpha = 0.05)
+tt.DESeq.sva.p53 <- lfcShrink(ddssva.DESeq.p53, res = tt.DESeq.sva.p53, coef = "Vector_p53_vs_REN", type = "apeglm")
+data.frame(tt.DESeq.sva.p53) %>% data.frame() %>% arrange(log2FoldChange) %>% head(50)
+DEgenes.DESeq2.sva.p53 <- gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.p53)[tt.DESeq.sva.p53$padj < 0.05 & abs(tt.DESeq.sva.p53$log2FoldChange) > 1, ]))
+DEgenes.DESeq2.sva.p53_up <- gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.p53)[tt.DESeq.sva.p53$padj < 0.05 & tt.DESeq.sva.p53$log2FoldChange > 1, ]))
+DEgenes.DESeq2.sva.p53_down <- gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.p53)[tt.DESeq.sva.p53$padj < 0.05 & tt.DESeq.sva.p53$log2FoldChange < -1, ]))
+summary(tt.DESeq.sva.p53)
+length(DEgenes.DESeq2.sva.p53)
+```
+
+We obtain a total amount of 5658 DEGs, 2847 of them Up-regulated and 2811 Down-regulated, starting from a set of 14992 genes (after filtering), which supposes a 38% of DEGs, which is a lot. It must be taken into account that the only filter to consider those genes as DEGs was a padj <0.05. In case of considering a logFC > 1, we obtain 530 genes.
+
+#### Raw p-values distribution
+
+Diagnostics plots for DE analysis:
+
+```{r, fig.width=10, fig.height=10}
+hist(tt.DESeq.sva.p53$pvalue, xlab="Raw P-values", main="DESeq2 + SVA p53", las=1)
+abline(1000, 1, lwd=2)
+```
+
+As we can see, the distribution is suuuper good.
+
+```{r}
+tt.DESeq.sva.p53_tb <- tt.DESeq.sva.p53 %>%
+  data.frame() %>%
+  rownames_to_column(var="Ensembl_ID_version") %>%
+  as_tibble()
+tt.DESeq.sva.p53_tb$Ensembl_ID <- gsub("\\..*","",tt.DESeq.sva.p53_tb$Ensembl_ID_version)
+
+tt.DESeq.sva.p53_tb <- tt.DESeq.sva.p53_tb %>%
+  relocate(Ensembl_ID, .after = Ensembl_ID_version)
+```
+
+There are three plots below used to assess our results.
+
+### MA plot 
+
+The MA plot explores the mean expression level of the genes with the fold change, highlighting the genes that are differentially expressed (padj < 0.05) using colored data points. We hope to see a good number of differentially expressed genes that span the range of expression values.
+
+```{r ma-plot-DESeq2, fig.align="center"}
+# Plot shrunken values
+plotMA(tt.DESeq.sva.p53, 
+       alpha = 0.05, 
+       main = "Shrunken LFC",
+       ylim = c(-4,4))
+```
+
+### Volcano plot
+
+```{r, fig.width=15, fig.height=15}
+volcano_data.p53 <- as.data.frame(cbind(tt.DESeq.sva.p53$log2FoldChange, tt.DESeq.sva.p53$padj))
+rownames(volcano_data.p53) <- tt.DESeq.sva.p53_tb$Ensembl_ID
+volcano_data.p53 = volcano_data.p53 %>%
+	rownames_to_column("ensembl_id") %>%
+	dplyr::rename(log2FC = V1, FDR = V2)
+volcano_data.p53 = merge(volcano_data.p53,rowData(se), by = "ensembl_id")
+Volcano_p53 = EnhancedVolcano(volcano_data.p53,
+    lab = volcano_data.p53$mgi_symbol, selectLab = c("Trp53","Cdkn1a"),
+    colAlpha = 0.9,
+    x = 'log2FC', y = 'FDR', pCutoff = 0.05, FCcutoff=1, labSize = 6, 
+    legendPosition = "right",
+    legendLabels = c('Not sig.','log2 FC','p.adj',
+      'p.adj & log2 FC'),
+    title = "",
+    subtitle = "",
+    boxedLabels = TRUE,
+    labFace = 'bold',
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    colConnectors = 'black')
+
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_volcano_p53.pdf"), width = 10, height = 10)
+Volcano_p53
+dev.off()
+```
+
+
+```{r}
+volcano_data.p53 <- volcano_data.p53 %>% 
+	as.data.frame() %>%
+  mutate(
+    Significance = case_when(
+      abs(log2FC) >= log(2) & FDR <= 0.05 ~ "FDR 0.05 & FC > 2", 
+      TRUE ~ "Unchanged")
+  )
+```
+
+
+# Functional Analysis
+
+## GSEA
+
+### p53
+
+```{r}
+GS_hallmark <- getGmt(here("analysis","data","derived_data", "proteomics", "extdata", "MSigDb_mouse","mh.all.v2023.1.Mm.symbols.gmt.txt"),  geneIdType=SymbolIdentifier())
+GS_curated <- getGmt(here("analysis","data","derived_data", "proteomics", "extdata", "MSigDb_mouse","m2.cp.v2023.1.Mm.symbols.gmt.txt"),  geneIdType=SymbolIdentifier())
+ensembl.hallmark.p53 <- mapIdentifiers(GS_hallmark, ENSEMBLIdentifier("org.Mm.eg.db"))
+ensembl.curated.p53 <- mapIdentifiers(GS_curated, ENSEMBLIdentifier("org.Mm.eg.db"))
+gsc <- GeneSetCollection(c(ensembl.hallmark.p53 , ensembl.curated.p53))
+gsc
+```
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+gsets.p53 <- geneIds(gsc)
+tt.DESeq.sva.p53_df <- data.frame(tt.DESeq.sva.p53)
+tt.DESeq.sva.p53_df$fcsign <- sign(tt.DESeq.sva.p53_df$log2FoldChange)
+tt.DESeq.sva.p53_df$logP <- -log10(tt.DESeq.sva.p53_df$pvalue)
+tt.DESeq.sva.p53_df$metric <- tt.DESeq.sva.p53_df$logP/tt.DESeq.sva.p53_df$fcsign
+tt.DESeq.sva.p53_df$metric[is.infinite(tt.DESeq.sva.p53_df$metric)] <- c(-302,-302.1) ## It is the lowest metric 
+stats.DESeq.sva.p53 <- tt.DESeq.sva.p53_df$metric
+names(stats.DESeq.sva.p53) <- gsub("\\..*","", rownames(tt.DESeq.sva.p53_df))
+fgseares.DESeq.sva.p53 <- fgsea(gsets.p53, stats.DESeq.sva.p53, minSize=5, maxSize=300, nproc = 1)
+sign_fgseares.DESeq.sva.p53 <- fgseares.DESeq.sva.p53[fgseares.DESeq.sva.p53$padj < 0.05, ]
+```
+
+```{r, fig.width=15}
+gsea_hm_p53_path_p53 = plotEnrichment(gsets.p53$HALLMARK_P53_PATHWAY, stats.DESeq.sva.p53) +
+  theme(axis.text = element_text(size=16))
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_GSEA_hm_p53_Pathway_p53.pdf"), width = 10, height = 10)
+gsea_hm_p53_path_p53
+dev.off()
+```
+
+
+### Example of how the accuracy was assessed
+
+Building the Gene Sets
+```{r}
+total_gs <- names(gsc)
+hallmark.p53 <- c()
+for (pathway in names(GS_hallmark)){
+  if (22059 %in% geneIds(GS_hallmark[[pathway]])){
+    hallmark.p53 <- c(hallmark.p53, pathway)
+  }
+}
+curated.p53 <- c()
+for (pathway in names(GS_curated)){
+  if (22059 %in% geneIds(GS_curated[[pathway]])){
+    curated.p53 <- c(curated.p53, pathway)
+  }
+}
+p53.pathways <- c(hallmark.p53, curated.p53)
+nop53.pathways <- setdiff(total_gs, p53.pathways)
+```
+
+```{r}
+gs_accuracy <- function(enriched){
+  TP <- length(intersect(p53.pathways, enriched))
+  FP <- length(intersect(nop53.pathways, enriched))
+  TN <- length(intersect(nop53.pathways, setdiff(total_gs, enriched)))
+  FN <- length(intersect(p53.pathways, setdiff(total_gs, enriched)))
+  precision <- TP/(FP+TP)
+  recall <- TP/(TP+FN)
+  accuracy <- (TP+TN)/(TP+FP+FN+TN)
+  err <- (FP+FN)/(TP+TN+FN+FP)
+  fscore <- 2*precision*recall/(precision + recall)
+  specificity <- TN/(TN+FP)
+  fpr <- FP/(TN+FP)
+  list_of_parameters <- list(precision = precision, recall = recall, accuracy = accuracy, err = err, Fscore = fscore, specificity = specificity, fpr = fpr)
+  return(list_of_parameters)
+}
+```
+
+```{r}
+DESeq.sva.p53.enriched <- sign_fgseares.DESeq.sva.p53$pathway
+gs_accuracy(DESeq.sva.p53.enriched)
+```
+
+```{r}
+ego.p53 <- enrichGO(
+  DEgenes.DESeq2.sva.p53,
+  "ENSEMBL",
+  universe = rowData(se)$ensembl_id,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r}
+ego.p53_up <- enrichGO(
+  DEgenes.DESeq2.sva.p53_up,
+  "ENSEMBL",
+  universe = rowData(se)$ensembl_id,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r}
+ego.p53_down <- enrichGO(
+  DEgenes.DESeq2.sva.p53_down,
+  "ENSEMBL",
+  universe = rowData(se)$ensembl_id,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+GO_terms_p53_padj0.05_LFC0 = clusterProfiler::dotplot(ego.p53, showCategory = 25)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_GO_terms_p53_padj0.05_LFC0.pdf"), width = 10, height = 10)
+GO_terms_p53_padj0.05_LFC0
+dev.off()
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+GO_terms_p53_padj0.05_LFC1_up = clusterProfiler::dotplot(ego.p53_up, showCategory = 25)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+GO_terms_p53_padj0.05_LFC1_down = clusterProfiler::dotplot(ego.p53_down, showCategory = 25)
+```
+
+
+
+```{r}
+sigEntrez.p53 = mapIds(org.Mm.eg.db,
+                    keys=DEgenes.DESeq2.sva.p53, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+# We obtain 86 NAs from the 5658 genes, which accounts for 1.52% of the genes
+# We will assume this error and go on
+sigEntrez_nna.p53 <- na.exclude(sigEntrez.p53)
+
+universe = mapIds(org.Mm.eg.db,
+                    keys=rowData(se)$ensembl_id, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universe_nna = na.exclude(universe)
+```
+
+```{r}
+eKEGG.p53 = enrichKEGG(gene = sigEntrez_nna.p53,
+					 organism = "mmu",
+					 keyType = "kegg",
+					 pvalueCutoff = 0.05,
+					 pAdjustMethod = "BH",
+					 universe = universe_nna,
+					 qvalueCutoff = 0.05)
+```
+
+```{r, fig.width=10, fig.height=10}
+KEGG_p53_padj0.05_LFC0 = clusterProfiler::dotplot(eKEGG.p53, showCategory = 10)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_KEGG_p53_padj0.05_LFC0.pdf"), width = 10, height = 10)
+KEGG_p53_padj0.05_LFC0
+dev.off()
+```
+
+```{r}
+search_kegg_organism("mmu", by = "kegg_code")
+kk <- enrichKEGG(gene = sigEntrez_nna.p53, organism = "mmu")
+head(kk, n=10)
+```
+
+```{r}
+sigResults.p53 <- as.data.frame(tt.DESeq.sva.p53_tb)[tt.DESeq.sva.p53_tb$Ensembl_ID %in% DEgenes.DESeq2.sva.p53, ]
+sigResults.p53$Entrez <- sigEntrez.p53
+logFC.p53 <- sigResults.p53$log2FoldChange
+names(logFC.p53) <- sigResults.p53$Entrez
+pathview(gene.data = logFC.p53, 
+         pathway.id = "mmu04115", 
+         species = "mmu", 
+         limit = list(gene=2, cpd=1),
+         bins = list(gene = 30, cpd = 20), 
+         mid = list(gene = "grey", cpd = "blue"))
+```
+
+```{r}
+# Move all pathway files to results
+pathway_files <- list.files(here("scripts"), pattern = "mmu")
+move_files <- function(files){
+file.rename(from = file.path(here("scripts"), files), to = file.path(here("results", "transcriptomics", "plots"), paste0("p53_", files)))
+	}
+lapply(pathway_files, move_files)
+```
+
+
+## RNF
+
+By conducting the exact same methodology as in p53 with the RNF comparison we obtain a weird distribution of the raw p-values when considering SV1 and SV2. For that reason, I decided to explore other surrogate variables to see whether the distribution changes or not. I must admit that I don't know if this is more like a cherrypicking thing than what should be done. My reasoning behind this decision is that: In the end, SV are differences found due to a non desired experimental effect. Thus, we corrected for some SV in p53 that gave good results, but a reason for the good results in that comparison is the fact that the SV used are related to p53, thus, it is normal to obtain better results with p53 if the variable it's affecting it. However, if we include the same variable in another comparison design, we are adding a difference in the effect of p53 to a comparison where p53 is not involved. That's why I decided to explore other SV and end up obtaining really good results.
+
+Now, I will explore 5 possible SV and add those that might have an effect between REN and RNF from what we observe in the plots.
+
+```{r}
+set.seed(999)
+dds.filt <- estimateSizeFactors(dds.filt)
+dat  <- counts(dds.filt, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ Vector, colData(dds))
+mod0 <- model.matrix(~   1, colData(dds))
+svseq <- svaseq(dat, mod, mod0, n.sv = 5)
+```
+
+```{r}
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:5) {
+  stripchart(svseq$sv[, i] ~ dds.filt$Vector, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+ }
+```
+
+```{r}
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:5) {
+  stripchart(svseq$sv[, i] ~ dds.filt$Replicate, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+ }
+```
+
+We see that SV4 is the variable with the highest degree of difference between RNF and REN. By adding that variable and SV2 to the model we obtain the best results.
+
+```{r}
+ddssva2 <- dds.filt
+ddssva2$SV1 <- svseq$sv[,1]
+ddssva2$SV2 <- svseq$sv[,2]
+design(ddssva2) <- ~ SV1 + SV2 + Vector
+```
+
+### DESeq2 + SVA
+
+```{r}
+ddssva2.RNF <- ddssva2[,ddssva2$Vector == "REN" | ddssva2$Vector == "RNF"]
+ddssva2.RNF$Vector <- droplevels(ddssva2.RNF$Vector)
+ddssva2.RNF$Vector <- relevel(ddssva2.RNF$Vector, "REN")
+```
+
+```{r}
+matrix_of_rownames = as.data.frame(rowData(ddssva2.RNF)) %>%
+	rownames_to_column("Ensembl_ID_version")
+matrix_TMM_RNF144b = as.data.frame(assays(ddssva2.RNF)[["TMM"]]) %>%
+	rownames_to_column("Ensembl_ID_version") %>%
+	left_join(matrix_of_rownames, by = join_by("Ensembl_ID_version"))
+```
+
+
+```{r}
+ddssva2.DESeq.RNF <- DESeq(ddssva2.RNF)
+```
+
+```{r}
+tt.DESeq.sva.RNF <- results(ddssva2.DESeq.RNF, contrast = c("Vector", "RNF", "REN"), alpha = 0.05)
+tt.DESeq.sva.RNF <- lfcShrink(ddssva2.DESeq.RNF, res = tt.DESeq.sva.RNF, coef = "Vector_RNF_vs_REN", type = "apeglm")
+data.frame(tt.DESeq.sva.RNF) %>% data.frame() %>% arrange(log2FoldChange) %>% head(50)
+summary(tt.DESeq.sva.RNF)
+DEgenes.DESeq2.sva.RNF <- gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.RNF)[tt.DESeq.sva.RNF$padj < 0.05 & !is.na(tt.DESeq.sva.RNF$padj), ]))
+DEgenes.DESeq2.sva.RNF_permissive <- gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.RNF)[tt.DESeq.sva.RNF$padj < 0.1 & !is.na(tt.DESeq.sva.RNF$padj), ]))
+length(DEgenes.DESeq2.sva.RNF)
+```
+
+```{r}
+tt.DESeq.sva.RNF_tb <- tt.DESeq.sva.RNF %>%
+  data.frame() %>%
+  rownames_to_column(var="Ensembl_ID_version") %>%
+  as_tibble()
+tt.DESeq.sva.RNF_tb$Ensembl_ID <- gsub("\\..*","",tt.DESeq.sva.RNF_tb$Ensembl_ID_version)
+
+tt.DESeq.sva.RNF_tb <- tt.DESeq.sva.RNF_tb %>%
+  relocate(Ensembl_ID, .after = Ensembl_ID_version)
+```
+
+```{r}
+DEgenes.DESeq2.sva.RNF_df <- tt.DESeq.sva.RNF_tb[tt.DESeq.sva.RNF_tb$Ensembl_ID %in% DEgenes.DESeq2.sva.RNF,]
+DEgenes.DESeq2.sva.RNF_permissive_df <- tt.DESeq.sva.RNF_tb[tt.DESeq.sva.RNF_tb$Ensembl_ID %in% DEgenes.DESeq2.sva.RNF_permissive,]
+```
+
+```{r}
+write.csv(DEgenes.DESeq2.sva.RNF_df, file = here("results", "transcriptomics", "datasets", "TopTable_DEGs_RNF.csv"), row.names = FALSE)
+write.csv(DEgenes.DESeq2.sva.RNF_permissive_df, file = here("results", "transcriptomics", "datasets", "TopTable_DEGs_RNF_permissive.csv"), row.names = FALSE)
+```
+
+#### Raw p-values distribution
+
+Diagnostics plots for DE analysis:
+
+```{r, fig.width=10, fig.height=10}
+hist(tt.DESeq.sva.RNF$pvalue, xlab="Raw P-values", main="DESeq2 + SVA2 + SVA4 RNF144B", las=1, ylim = c(0,2500))
+abline(1000, 1, lwd=2)
+```
+
+As we can see, the distribution is very good.
+
+There are three plots below used to assess our results.
+
+### MA plot 
+
+The MA plot explores the mean expression level of the genes with the fold change, highlighting the genes that are differentially expressed (padj < 0.05) using colored data points. We hope to see a good number of differentially expressed genes that span the range of expression values.
+
+```{r ma-plot-DESeq2, fig.align="center"}
+# Plot shrunken values
+plotMA(tt.DESeq.sva.RNF, 
+       alpha = 0.05, 
+       main = "Shrunken LFC",
+       ylim = c(-4,4))
+```
+
+### Volcano plot
+
+```{r, fig.width=10, fig.height=10}
+volcano_data.RNF <- as.data.frame(cbind(tt.DESeq.sva.RNF$log2FoldChange, tt.DESeq.sva.RNF$padj))
+rownames(volcano_data.RNF) <- tt.DESeq.sva.RNF_tb$Ensembl_ID
+volcano_data.RNF = volcano_data.RNF %>%
+	rownames_to_column("ensembl_id") %>%
+	dplyr::rename(log2FC = V1, FDR = V2)
+volcano_data.RNF = merge(volcano_data.RNF,rowData(se), by = "ensembl_id")
+
+keyvals <- ifelse(
+    abs(volcano_data.RNF$log2FC) > 1 & volcano_data.RNF$FDR < 0.05, 'red',
+        'grey')
+names(keyvals)[keyvals == 'red'] <- 'up-regulated'
+names(keyvals)[keyvals == 'grey'] <- 'ns or down_regulated'
+
+Volcano_RNF = EnhancedVolcano(volcano_data.RNF,
+    lab = "",
+    colAlpha = 0.9,
+    colCustom = keyvals,
+    x = 'log2FC', y = 'FDR', pCutoff = 0.05, FCcutoff=1, labSize = 6, 
+    legendPosition = "none",
+    legendLabels = c('Not sig.','log2 FC','p.adj',
+      'p.adj & log2 FC'),
+    title = "",
+    subtitle = "",
+    boxedLabels = FALSE,
+    parseLabels = FALSE,
+    labFace = 'bold',
+    cutoffLineWidth = 1,
+    drawConnectors = FALSE,
+    widthConnectors = 0.3,
+    cutoffLineType = "longdash",
+    caption = "",
+    colConnectors = 'black',
+    gridlines.major = FALSE, gridlines.minor = FALSE)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_volcano_RNF.pdf"), width = 10, height = 10)
+Volcano_RNF
+dev.off()
+```
+
+```{r}
+TopTable_RNF144b_all_genes = as.data.frame(volcano_data.RNF) %>%
+	dplyr::select(-mgi_symbol) %>%
+	left_join(matrix_TMM_RNF144b, by = join_by("ensembl_id"))
+write.xlsx(TopTable_RNF144b_all_genes,file = here("analysis","data","derived_data","transcriptomics","TopTable_RNF144b_all_genes.xlsx"))
+```
+
+
+```{r}
+Volcano_RNF_scaled = EnhancedVolcano(volcano_data.RNF,
+    lab = NA,
+    colAlpha = 0.9,
+    colCustom = keyvals,
+    x = 'log2FC', y = 'FDR', pCutoff = 0.05, FCcutoff=1, labSize = 6, 
+    legendPosition = "none",
+    legendLabels = c('Not sig.','log2 FC','p.adj',
+      'p.adj & log2 FC'),
+    title = "",
+    subtitle = "",
+    boxedLabels = FALSE,
+    parseLabels = FALSE,
+    labFace = 'bold',
+    cutoffLineWidth = 0,
+    drawConnectors = FALSE,
+    widthConnectors = 0.3,
+    cutoffLineType = "blank",
+    caption = "",
+    colConnectors = 'black',
+    gridlines.major = FALSE, gridlines.minor = FALSE, xlim = c(-8,8))
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_volcano_RNF_scaled.pdf"), width = 10, height = 10)
+Volcano_RNF_scaled
+dev.off()
+```
+
+# Functional Analysis
+
+## GSEA
+
+### RNF
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+tt.DESeq.sva.RNF_df <- data.frame(tt.DESeq.sva.RNF)
+tt.DESeq.sva.RNF_df$fcsign <- sign(tt.DESeq.sva.RNF_df$log2FoldChange)
+tt.DESeq.sva.RNF_df$logP <- -log10(tt.DESeq.sva.RNF_df$pvalue)
+tt.DESeq.sva.RNF_df$metric <- tt.DESeq.sva.RNF_df$logP/tt.DESeq.sva.RNF_df$fcsign
+stats.DESeq.sva.RNF <- tt.DESeq.sva.RNF_df$metric
+names(stats.DESeq.sva.RNF) <- gsub("\\..*","", rownames(tt.DESeq.sva.RNF_df))
+fgseares.DESeq.sva.RNF <- fgsea(gsets.p53, stats.DESeq.sva.RNF, minSize=150, maxSize=300, nproc = 1)
+fgseares.DESeq.sva.RNF_sig = fgseares.DESeq.sva.RNF[fgseares.DESeq.sva.RNF$padj < 0.05 & fgseares.DESeq.sva.RNF$NES >1,]
+sign_fgseares.DESeq.sva.RNF <- fgseares.DESeq.sva.RNF[fgseares.DESeq.sva.RNF$padj < 0.05, ]
+```
+
+```{r}
+# Tidy results
+fgseaResTidy <- fgseares.DESeq.sva.RNF %>%
+	filter(padj < 0.2) %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+```
+
+```{r, fig.height=10, fig.width=10}
+GSEA_RNF = ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_GSEA_RNF.pdf"), width = 10, height = 10)
+GSEA_RNF
+dev.off()
+```
+
+
+```{r, fig.width=15}
+GSEA_hm_p53_pathway_RNF = plotEnrichment(gsets.p53$HALLMARK_P53_PATHWAY, stats.DESeq.sva.RNF) +
+  theme(axis.text = element_text(size=16))
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_GSEA_hm_p53_pathway_RNF.pdf"), width = 10, height = 10)
+GSEA_hm_p53_pathway_RNF
+dev.off()
+```
+
+```{r}
+ego.RNF <- enrichGO(
+  DEgenes.DESeq2.sva.RNF,
+  "ENSEMBL",
+  universe = rowData(se)$ensembl_id,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+GO_terms_RNF_padj0.05_LFC0 = clusterProfiler::dotplot(ego.RNF, showCategory = 25)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_GO_terms_padj0.05_LFC0_RNF.pdf"), width = 10, height = 10)
+GO_terms_RNF_padj0.05_LFC0
+dev.off()
+```
+
+```{r}
+sigEntrez.RNF = mapIds(org.Mm.eg.db,
+                    keys=DEgenes.DESeq2.sva.RNF, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+# We obtain 7 NAs from the 632 genes, which accounts for 1.1% of the genes
+# We will assume this error and go on
+sigEntrez_nna.RNF <- na.exclude(sigEntrez.RNF)
+```
+
+```{r}
+eKEGG.RNF = enrichKEGG(gene = sigEntrez_nna.RNF,
+					 organism = "mmu",
+					 keyType = "kegg",
+					 pvalueCutoff = 0.05,
+					 pAdjustMethod = "BH",
+					 universe = universe_nna,
+					 qvalueCutoff = 0.05)
+```
+
+```{r, fig.width=10, fig.height=10}
+KEGG_RNF_padj0.05_LFC0 = clusterProfiler::dotplot(eKEGG.RNF, showCategory = 10)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Transcriptomic_KEGG_RNF_padj0.05_LFC0_RNF.pdf"), width = 10, height = 10)
+KEGG_RNF_padj0.05_LFC0
+dev.off()
+```
+
+```{r}
+search_kegg_organism("mmu", by = "kegg_code")
+kk <- enrichKEGG(gene = sigEntrez_nna.RNF, organism = "mmu")
+head(kk, n=10)
+```
+
+```{r}
+sigResults.RNF <- as.data.frame(tt.DESeq.sva.RNF_tb)[tt.DESeq.sva.RNF_tb$Ensembl_ID %in% DEgenes.DESeq2.sva.RNF, ]
+sigResults.RNF$Entrez <- sigEntrez.RNF
+logFC.RNF <- sigResults.RNF$log2FoldChange
+names(logFC.RNF) <- sigResults.RNF$Entrez
+```
+
+```{r}
+pathview(gene.data = logFC.RNF, 
+         pathway.id = "mmu04115", 
+         species = "mmu", 
+         limit = list(gene=1, cpd=1),
+         bins = list(gene = 30, cpd = 20), 
+         mid = list(gene = "grey", cpd = "blue"))
+```
+
+```{r}
+pathview(gene.data = logFC.RNF, 
+         pathway.id = "mmu04110", 
+         species = "mmu", 
+         limit = list(gene=1, cpd=1),
+         bins = list(gene = 30, cpd = 20), 
+         mid = list(gene = "grey", cpd = "blue"))
+```
+
+We will also explore two pathways significantly enriched that are related with apoptosis and cancer:
+
+```{r}
+## Apoptosis
+pathview(gene.data = logFC.RNF, 
+         pathway.id = "mmu04210", 
+         species = "mmu", 
+         limit = list(gene=1, cpd=1),
+         bins = list(gene = 30, cpd = 20), 
+         mid = list(gene = "grey", cpd = "blue"))
+```
+
+```{r}
+## Proteoglycans in cancer
+pathview(gene.data = logFC.RNF, 
+         pathway.id = "mmu05205", 
+         species = "mmu", 
+         limit = list(gene=1, cpd=1),
+         bins = list(gene = 30, cpd = 20), 
+         mid = list(gene = "grey", cpd = "blue"))
+```
+
+```{r}
+# Move all pathway files to results
+pathway_files <- list.files(here("scripts"), pattern = "mmu")
+move_files <- function(files){
+file.rename(from = file.path(here("scripts"), files), to = file.path(here("results", "transcriptomics", "plots"), paste0("RNF_", files)))
+	}
+lapply(pathway_files, move_files)
+```
+
+
+# Proteomics
+
+## Importing the dataset
+
+```{r}
+all_data_df <- read_xlsx(here("analysis","data","raw_data","proteomics","2020MQ044-PROTEOMICS.xlsx"), sheet = 1, range = "A2:AP6495")
+imp_info_df <- all_data_df[,c(3,15:42)]
+options(digits = 17)
+colnames(imp_info_df) = c("Accession","CT1_PA","CT2_PA","CT3_PA","RNF1_PA",
+													"RNF2_PA","RNF3_PA","P531_PA","P532_PA","P533_PA",
+													"CT1_LPA","CT2_LPA","CT3_LPA","RNF1_LPA",
+													"RNF2_LPA","RNF3_LPA","P531_LPA","P532_LPA",
+													"P533_LPA","TOTAL_COUNT","Control_COUNT","RNF144B_COUNT",
+													"P53_COUNT","LOG2FC_RNF144B","pvalue_RNF144B",
+													"padj_RNF144B","LOG2FC_P53","pvalue_P53","padj_P53")
+## Filtering of the lowly expressed
+imp_info_df = imp_info_df %>%
+	filter(TOTAL_COUNT > 2)
+
+df_RNF_analysis <- imp_info_df %>%
+  dplyr::select(Accession, CT1_LPA, CT2_LPA, CT3_LPA, RNF1_LPA, RNF2_LPA, RNF3_LPA, LOG2FC_RNF144B, pvalue_RNF144B, padj_RNF144B) %>%
+  dplyr::mutate(data = across(.cols = 2:10, as.numeric))
+df_RNF_analysis <- cbind(df_RNF_analysis$Accession, df_RNF_analysis$data)
+colnames(df_RNF_analysis) <- c("ID", "CT1", "CT2", "CT3", "RNF1", "RNF2", "RNF3", "log2FC", "pvalue", "padj")
+```
+
+```{r}
+df_p53_analysis <- imp_info_df %>%
+  dplyr::select(Accession, CT1_LPA, CT2_LPA, CT3_LPA, P531_LPA, P532_LPA, P533_LPA, LOG2FC_P53, pvalue_P53, padj_P53) %>%
+  dplyr::mutate(data = across(.cols = 2:10, as.numeric))
+df_p53_analysis <- cbind(df_p53_analysis$Accession, df_p53_analysis$data)
+colnames(df_p53_analysis) <- c("ID", "CT1", "CT2", "CT3", "p531", "p532", "p533", "log2FC", "pvalue", "padj")
+```
+
+# RNF
+
+## UP: over-expressed proteins 
+
+### Building of the purified datasets
+
+The datasets will be built based on importance. After that, the lists of proteins will be used for functional and enrichment analysis.
+
+#### 3 RNF144b 0 CT
+Proteins found in 3 replicates of RNF144b and 0 of controls. No significance parameter can be retrieved from these proteins, however, the mean of Log2 Protein Abundance and Standard deviation of this parameter can be calculated. These proteins will be considered those of major relevance since they are clearly expressed in our "treated" samples and not in the controls, suggesting that they might be over-expressed due to a lack of RNF144b. Maybe for the role of RNF144b as a E3 Ub-ligase and its direct effect under this protein, or an indirect effect to a protein that regulates somehow these proteins:
+```{r}
+CT0RNF3_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 3 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0, ]
+CT0RNF3_UP_RNF$LPA_mean_RNF <- rowMeans(CT0RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")])
+CT0RNF3_UP_RNF$LPA_sd_RNF <- apply(CT0RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT0RNF3_UP_RNF$LPA_mean_CT <- NA
+CT0RNF3_UP_RNF$LPA_sd_CT <- NA
+```
+
+#### 2 RNF144b 0 CT
+
+```{r}
+CT0RNF2_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 3 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1, ]
+CT0RNF2_UP_RNF$LPA_mean_RNF <- apply(CT0RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT0RNF2_UP_RNF$LPA_sd_RNF <- apply(CT0RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT0RNF2_UP_RNF$LPA_mean_CT <- NA
+CT0RNF2_UP_RNF$LPA_sd_CT <- NA
+```
+
+#### 1 RNF144b 0 CT
+
+```{r}
+CT0RNF1_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 3 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2, ]
+## We will create a column that says mean, however, this is not the real mean of the value, since it is just the unique value within the replicates, and no sd will be calculated
+CT0RNF1_UP_RNF$LPA_mean_RNF <- apply(CT0RNF1_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT0RNF1_UP_RNF$LPA_sd_RNF <- NA
+## Now we have the "mean" value of abundance, we can compute the range to see if this expression values are big enough to take them into consideration
+range(CT0RNF1_UP_RNF$LPA_mean)
+CT0RNF1_UP_RNF$LPA_mean_CT <- NA
+CT0RNF1_UP_RNF$LPA_sd_CT <- NA
+```
+Maybe the min value can be deprecated, but a value of 25 may involve some kind of importance. However, we will discard those proteins with no significance since they are not really reliable. In fact, for some of the subsets, we will discard those proteins with presence only in 1 replicate.
+
+#### 3 RNF144b 1 CT
+
+Now we start obtaining logFC values, so, we need to take into account those logFC with a positive value. However, we do not obtain a significance value, this involves that despite we obtain a logFC value, it might not be significant. For that reason, we should apply a cut-off in terms of logFC to avoid filling the list with False Positives. We will keep a dataset with all positive logFC and then we will filter another dataset with proteins with at least 1 logFC:
+```{r}
+CT1RNF3_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC > 0, ]
+CT1RNF3_UP_RNF$LPA_mean_RNF <- rowMeans(CT1RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")])
+CT1RNF3_UP_RNF$LPA_sd_RNF <- apply(CT1RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT1RNF3_UP_RNF$LPA_mean_CT <- apply(CT1RNF3_UP_RNF[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1RNF3_UP_RNF$LPA_sd_CT <- NA
+CT1RNF3_UP_RNF_1FC <- CT1RNF3_UP_RNF[CT1RNF3_UP_RNF$log2FC > 1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+Even though there are samples with only 1 replicate, since we find presence in the three replicates in the other condition we will consider these proteins as a similar confidence than those in 3vs0, despite not obtaining a significance value. For those proteins with a negative logFC in this subset we will consider the NAs in the CT condition with the minimum value since it would not be reliable to consider those as with a higher expression in the control since two replicates have a lack of expression.
+
+#### 2 RNF144b 1 CT
+
+```{r}
+CT1RNF2_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC > 0, ]
+CT1RNF2_UP_RNF$LPA_mean_RNF <- apply(CT1RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT1RNF2_UP_RNF$LPA_sd_RNF <- apply(CT1RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT1RNF2_UP_RNF$LPA_mean_CT <- apply(CT1RNF2_UP_RNF[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1RNF2_UP_RNF$LPA_sd_CT <- NA
+CT1RNF2_UP_RNF_1FC <- CT1RNF2_UP_RNF[CT1RNF2_UP_RNF$log2FC > 1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+Similar reasoning as the previous subset.
+
+#### 3 RNF144b 2 CT
+
+Now we start obtaining logFC values, so, we need to take into account those logFC with a positive value. In addition, we start to have significance values, thus, we will consider as significant those proteins with a padj < 0.05. However, in case we find no significant results, we might include those proteins with a pvalue < 0.05. In more strict subsets, based on the literature, we will consider a FC > 1.5 as a cutoff. It is extracted from the following paper: Integrated microbiome, metabolome, and proteome analysis identifies a novel interplay among commensal bacteria, metabolites and candidate targets in non‐small cell lung cancer or 1.2 in USP35 mitigates endoplasmic reticulum stress-induced apoptosis by stabilizing RRBP1 in non-small cell lung cancer
+```{r}
+CT2RNF3_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$padj < 0.05, ]
+CT2RNF3_UP_RNF$LPA_mean_RNF <- rowMeans(CT2RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")])
+CT2RNF3_UP_RNF$LPA_sd_RNF <- apply(CT2RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT2RNF3_UP_RNF$LPA_mean_CT <- apply(CT2RNF3_UP_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF3_UP_RNF$LPA_sd_CT <- apply(CT2RNF3_UP_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2RNF3_UP_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT2RNF3_UP_RNF_pval$LPA_mean_RNF <- rowMeans(CT2RNF3_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")])
+CT2RNF3_UP_RNF_pval$LPA_sd_RNF <- apply(CT2RNF3_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT2RNF3_UP_RNF_pval$LPA_mean_CT <- apply(CT2RNF3_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF3_UP_RNF_pval$LPA_sd_CT <- apply(CT2RNF3_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+##### Imputation of missing values with mean within condition
+```{r}
+CT2RNF3_UP_RNF_pval_imp <- CT2RNF3_UP_RNF_pval
+for(i in 1:nrow(CT2RNF3_UP_RNF_pval_imp)){
+	if(is.na(CT2RNF3_UP_RNF_pval_imp$CT1[i])){
+		CT2RNF3_UP_RNF_pval_imp$CT1[i] <- CT2RNF3_UP_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF3_UP_RNF_pval_imp$CT2[i])){
+		CT2RNF3_UP_RNF_pval_imp$CT2[i] <- CT2RNF3_UP_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF3_UP_RNF_pval_imp$CT3[i])){
+		CT2RNF3_UP_RNF_pval_imp$CT3[i] <- CT2RNF3_UP_RNF_pval_imp$LPA_mean_CT[i]
+	}
+}
+```
+
+
+#### 3 RNF144b 3 CT
+
+Same as the previous dataset
+```{r}
+CT3RNF3_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$padj < 0.05, ]
+CT3RNF3_UP_RNF$LPA_mean_RNF <- rowMeans(CT3RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")])
+CT3RNF3_UP_RNF$LPA_sd_RNF <- apply(CT3RNF3_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT3RNF3_UP_RNF$LPA_mean_CT <- rowMeans(CT3RNF3_UP_RNF[,c("CT1", "CT2", "CT3")])
+CT3RNF3_UP_RNF$LPA_sd_CT <- apply(CT3RNF3_UP_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3RNF3_UP_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT3RNF3_UP_RNF_pval$LPA_mean_RNF <- rowMeans(CT3RNF3_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")])
+CT3RNF3_UP_RNF_pval$LPA_sd_RNF <- apply(CT3RNF3_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT3RNF3_UP_RNF_pval$LPA_mean_CT <- rowMeans(CT3RNF3_UP_RNF_pval[,c("CT1", "CT2", "CT3")])
+CT3RNF3_UP_RNF_pval$LPA_sd_CT <- apply(CT3RNF3_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+#### 2 RNF144b 2 CT
+
+Same as the previous dataset
+```{r}
+CT2RNF2_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$padj < 0.05, ]
+CT2RNF2_UP_RNF$LPA_mean_RNF <- apply(CT2RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")],1, mean, na.rm = TRUE)
+CT2RNF2_UP_RNF$LPA_sd_RNF <- apply(CT2RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT2RNF2_UP_RNF$LPA_mean_CT <- apply(CT2RNF2_UP_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF2_UP_RNF$LPA_sd_CT <- apply(CT2RNF2_UP_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2RNF2_UP_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT2RNF2_UP_RNF_pval$LPA_mean_RNF <- apply(CT2RNF2_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT2RNF2_UP_RNF_pval$LPA_sd_RNF <- apply(CT2RNF2_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT2RNF2_UP_RNF_pval$LPA_mean_CT <- apply(CT2RNF2_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF2_UP_RNF_pval$LPA_sd_CT <- apply(CT2RNF2_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+```{r}
+CT2RNF2_UP_RNF_pval_imp <- CT2RNF2_UP_RNF_pval
+for(i in 1:nrow(CT2RNF2_UP_RNF_pval_imp)){
+	if(is.na(CT2RNF2_UP_RNF_pval_imp$CT1[i])){
+		CT2RNF2_UP_RNF_pval_imp$CT1[i] <- CT2RNF2_UP_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF2_UP_RNF_pval_imp$CT2[i])){
+		CT2RNF2_UP_RNF_pval_imp$CT2[i] <- CT2RNF2_UP_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF2_UP_RNF_pval_imp$CT3[i])){
+		CT2RNF2_UP_RNF_pval_imp$CT3[i] <- CT2RNF2_UP_RNF_pval_imp$LPA_mean_CT[i]
+	}
+}
+for(i in 1:nrow(CT2RNF2_UP_RNF_pval_imp)){
+	if(is.na(CT2RNF2_UP_RNF_pval_imp$RNF1[i])){
+		CT2RNF2_UP_RNF_pval_imp$RNF1[i] <- CT2RNF2_UP_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT2RNF2_UP_RNF_pval_imp$RNF2[i])){
+		CT2RNF2_UP_RNF_pval_imp$RNF2[i] <- CT2RNF2_UP_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT2RNF2_UP_RNF_pval_imp$RNF3[i])){
+		CT2RNF2_UP_RNF_pval_imp$RNF3[i] <- CT2RNF2_UP_RNF_pval_imp$LPA_mean_RNF[i]
+	}
+}
+```
+
+
+#### 1 RNF144b 1 CT
+
+We will not really rely on this dataset
+```{r}
+CT1RNF1_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2 & df_RNF_analysis$log2FC > 0, ]
+CT1RNF1_UP_RNF$LPA_mean_RNF <- apply(CT1RNF1_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT1RNF1_UP_RNF$LPA_sd_RNF <- NA
+CT1RNF1_UP_RNF$LPA_mean_CT <- apply(CT1RNF1_UP_RNF[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1RNF1_UP_RNF$LPA_sd_CT <- NA
+CT1RNF1_UP_RNF_1FC <- CT1RNF1_UP_RNF[CT1RNF1_UP_RNF$log2FC > 1,]
+```
+
+#### 2 RNF144b 3 CT
+
+Now, we will consider those proteins that are found in more replicates of the controls than on those of the RNF, but have a positive logFC:
+```{r}
+CT3RNF2_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$padj < 0.05, ]
+CT3RNF2_UP_RNF$LPA_mean_RNF <- apply(CT3RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")],1, mean, na.rm = TRUE)
+CT3RNF2_UP_RNF$LPA_sd_RNF <- apply(CT3RNF2_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT3RNF2_UP_RNF$LPA_mean_CT <- apply(CT3RNF2_UP_RNF[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF2_UP_RNF$LPA_sd_CT <- apply(CT3RNF2_UP_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3RNF2_UP_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC > 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT3RNF2_UP_RNF_pval$LPA_mean_RNF <- apply(CT3RNF2_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT3RNF2_UP_RNF_pval$LPA_sd_RNF <- apply(CT3RNF2_UP_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT3RNF2_UP_RNF_pval$LPA_mean_CT <- apply(CT3RNF2_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF2_UP_RNF_pval$LPA_sd_CT <- apply(CT3RNF2_UP_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+```{r}
+CT3RNF2_UP_RNF_pval_imp <- CT3RNF2_UP_RNF_pval
+for(i in 1:nrow(CT3RNF2_UP_RNF_pval_imp)){
+	if(is.na(CT3RNF2_UP_RNF_pval_imp$RNF1[i])){
+		CT3RNF2_UP_RNF_pval_imp$RNF1[i] <- CT3RNF2_UP_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT3RNF2_UP_RNF_pval_imp$RNF2[i])){
+		CT3RNF2_UP_RNF_pval_imp$RNF2[i] <- CT3RNF2_UP_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT3RNF2_UP_RNF_pval_imp$RNF3[i])){
+		CT3RNF2_UP_RNF_pval_imp$RNF3[i] <- CT3RNF2_UP_RNF_pval_imp$LPA_mean_RNF[i]
+	}
+}
+```
+
+
+#### 1 RNF144b 3 CT
+
+In this case, those proteins that are positive in this dataset will be changed so that they acquire a negative logFC since it is weird to obtain a positive FC with only presence of the protein in one replicate of RNF and 3 of CT.
+```{r}
+CT3RNF1_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2 & df_RNF_analysis$log2FC > 0, ]
+CT3RNF1_UP_RNF$LPA_mean_RNF <- apply(CT3RNF1_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT3RNF1_UP_RNF$LPA_sd_RNF <- NA
+CT3RNF1_UP_RNF$LPA_mean_CT <- apply(CT3RNF1_UP_RNF[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF1_UP_RNF$LPA_sd_CT <- apply(CT3RNF1_UP_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3RNF1_UP_RNF_1FC <- CT3RNF1_UP_RNF[CT3RNF1_UP_RNF$log2FC > 1,]
+```
+
+#### 1 RNF144b 2 CT
+
+Same reasoning as the previous dataset
+```{r}
+CT2RNF1_UP_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2 & df_RNF_analysis$log2FC > 0, ]
+CT2RNF1_UP_RNF$LPA_mean_RNF <- apply(CT2RNF1_UP_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT2RNF1_UP_RNF$LPA_sd_RNF <- NA
+CT2RNF1_UP_RNF$LPA_mean_CT <- apply(CT2RNF1_UP_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF1_UP_RNF$LPA_sd_CT <- apply(CT2RNF1_UP_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2RNF1_UP_RNF_1FC <- CT2RNF1_UP_RNF[CT2RNF1_UP_RNF$log2FC > 1,]
+```
+
+### FULL DATASET UP
+Now we have created all the datasets for the up-regulated proteins, we can create a big dataset with all the proteins that are significantly over-expressed in terms of p-value.
+```{r}
+## Dataset with ALL proteins from ALL subsets that are OVER-EXPRESSED with a logFC cutoff of > 0 and a p-value < 0.05
+UP_RNF_permissive_list <- list(CT0RNF3_UP_RNF, CT0RNF2_UP_RNF, CT0RNF1_UP_RNF, CT1RNF3_UP_RNF, CT1RNF2_UP_RNF, CT2RNF3_UP_RNF_pval, CT3RNF3_UP_RNF_pval, CT2RNF2_UP_RNF_pval, CT1RNF1_UP_RNF, CT3RNF2_UP_RNF_pval, CT3RNF1_UP_RNF, CT2RNF1_UP_RNF)
+UP_RNF_permissive <- UP_RNF_permissive_list %>%
+	purrr::reduce(full_join)
+UP_RNF_reliable_list <- list(CT0RNF3_UP_RNF, CT0RNF2_UP_RNF, CT1RNF3_UP_RNF, CT2RNF3_UP_RNF_pval_imp, CT3RNF3_UP_RNF_pval, CT2RNF2_UP_RNF_pval_imp, CT3RNF2_UP_RNF_pval_imp, CT3RNF1_UP_RNF)
+UP_RNF_reliable <- UP_RNF_reliable_list %>%
+	purrr::reduce(full_join)
+```
+
+## DOWN: down-expressed proteins
+
+### Building of the purified datasets
+
+Same procedure as before, but for the down regulated genes:
+
+#### 0 RNF144b 3 CT
+
+```{r}
+CT3RNF0_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 3, ]
+CT3RNF0_DOWN_RNF$LPA_mean_RNF <- NA
+CT3RNF0_DOWN_RNF$LPA_sd_RNF <- NA
+CT3RNF0_DOWN_RNF$LPA_mean_CT <- rowMeans(CT3RNF0_DOWN_RNF[,c("CT1", "CT2", "CT3")])
+CT3RNF0_DOWN_RNF$LPA_sd_CT <- apply(CT3RNF0_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+#### 0 RNF144b 2 CT
+
+```{r}
+CT2RNF0_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 3, ]
+CT2RNF0_DOWN_RNF$LPA_mean_RNF <- NA
+CT2RNF0_DOWN_RNF$LPA_sd_RNF <- NA
+CT2RNF0_DOWN_RNF$LPA_mean_CT <- apply(CT2RNF0_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF0_DOWN_RNF$LPA_sd_CT <- apply(CT2RNF0_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+#### 0 RNF144b 1 CT
+
+```{r}
+CT1RNF0_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 3, ]
+CT1RNF0_DOWN_RNF$LPA_mean_RNF <- NA
+CT1RNF0_DOWN_RNF$LPA_sd_RNF <- NA
+CT1RNF0_DOWN_RNF$LPA_mean_CT <- apply(CT1RNF0_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT1RNF0_DOWN_RNF$LPA_sd_CT <- apply(CT1RNF0_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+#### 1 RNF144b 3 CT
+
+```{r}
+CT3RNF1_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2 & df_RNF_analysis$log2FC < 0, ]
+CT3RNF1_DOWN_RNF$LPA_mean_RNF <- apply(CT3RNF1_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT3RNF1_DOWN_RNF$LPA_sd_RNF <- NA
+CT3RNF1_DOWN_RNF$LPA_mean_CT <- apply(CT3RNF1_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF1_DOWN_RNF$LPA_sd_CT <- apply(CT3RNF1_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3RNF1_DOWN_RNF_1FC <- CT3RNF1_DOWN_RNF[CT3RNF1_DOWN_RNF$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 1 RNF144b 2 CT
+
+```{r}
+CT2RNF1_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2 & df_RNF_analysis$log2FC < 0, ]
+CT2RNF1_DOWN_RNF$LPA_mean_RNF <- apply(CT2RNF1_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT2RNF1_DOWN_RNF$LPA_sd_RNF <- NA
+CT2RNF1_DOWN_RNF$LPA_mean_CT <- apply(CT2RNF1_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF1_DOWN_RNF$LPA_sd_CT <- apply(CT2RNF1_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2RNF1_DOWN_RNF_1FC <- CT2RNF1_DOWN_RNF[CT2RNF1_DOWN_RNF$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 2 RNF144b 3 CT
+
+```{r}
+CT3RNF2_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$padj < 0.05, ]
+CT3RNF2_DOWN_RNF$LPA_mean_RNF <- apply(CT3RNF2_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT3RNF2_DOWN_RNF$LPA_sd_RNF <- apply(CT3RNF2_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT3RNF2_DOWN_RNF$LPA_mean_CT <- apply(CT3RNF2_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF2_DOWN_RNF$LPA_sd_CT <- apply(CT3RNF2_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3RNF2_DOWN_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT3RNF2_DOWN_RNF_pval$LPA_mean_RNF <- apply(CT3RNF2_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT3RNF2_DOWN_RNF_pval$LPA_sd_RNF <- apply(CT3RNF2_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT3RNF2_DOWN_RNF_pval$LPA_mean_CT <- apply(CT3RNF2_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF2_DOWN_RNF_pval$LPA_sd_CT <- apply(CT3RNF2_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+```{r}
+CT3RNF2_DOWN_RNF_pval_imp <- CT3RNF2_DOWN_RNF_pval
+for(i in 1:nrow(CT3RNF2_DOWN_RNF_pval_imp)){
+	if(is.na(CT3RNF2_DOWN_RNF_pval_imp$RNF1[i])){
+		CT3RNF2_DOWN_RNF_pval_imp$RNF1[i] <- CT3RNF2_DOWN_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT3RNF2_DOWN_RNF_pval_imp$RNF2[i])){
+		CT3RNF2_DOWN_RNF_pval_imp$RNF2[i] <- CT3RNF2_DOWN_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT3RNF2_DOWN_RNF_pval_imp$RNF3[i])){
+		CT3RNF2_DOWN_RNF_pval_imp$RNF3[i] <- CT3RNF2_DOWN_RNF_pval_imp$LPA_mean_RNF[i]
+	}
+}
+```
+
+
+#### 3 RNF144b 3 CT
+
+```{r}
+CT3RNF3_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$padj < 0.05, ]
+CT3RNF3_DOWN_RNF$LPA_mean_RNF <- apply(CT3RNF3_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT3RNF3_DOWN_RNF$LPA_sd_RNF <- apply(CT3RNF3_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT3RNF3_DOWN_RNF$LPA_mean_CT <- apply(CT3RNF3_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF3_DOWN_RNF$LPA_sd_CT <- apply(CT3RNF3_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3RNF3_DOWN_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT3RNF3_DOWN_RNF_pval$LPA_mean_RNF <- apply(CT3RNF3_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT3RNF3_DOWN_RNF_pval$LPA_sd_RNF <- apply(CT3RNF3_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT3RNF3_DOWN_RNF_pval$LPA_mean_CT <- apply(CT3RNF3_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3RNF3_DOWN_RNF_pval$LPA_sd_CT <- apply(CT3RNF3_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+#### 2 RNF144b 2 CT
+
+```{r}
+CT2RNF2_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$padj < 0.05, ]
+CT2RNF2_DOWN_RNF$LPA_mean_RNF <- apply(CT2RNF2_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT2RNF2_DOWN_RNF$LPA_sd_RNF <- apply(CT2RNF2_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT2RNF2_DOWN_RNF$LPA_mean_CT <- apply(CT2RNF2_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF2_DOWN_RNF$LPA_sd_CT <- apply(CT2RNF2_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2RNF2_DOWN_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT2RNF2_DOWN_RNF_pval$LPA_mean_RNF <- apply(CT2RNF2_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT2RNF2_DOWN_RNF_pval$LPA_sd_RNF <- apply(CT2RNF2_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT2RNF2_DOWN_RNF_pval$LPA_mean_CT <- apply(CT2RNF2_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF2_DOWN_RNF_pval$LPA_sd_CT <- apply(CT2RNF2_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+```{r}
+CT2RNF2_DOWN_RNF_pval_imp <- CT2RNF2_DOWN_RNF_pval
+for(i in 1:nrow(CT2RNF2_DOWN_RNF_pval_imp)){
+	if(is.na(CT2RNF2_DOWN_RNF_pval_imp$CT1[i])){
+		CT2RNF2_DOWN_RNF_pval_imp$CT1[i] <- CT2RNF2_DOWN_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF2_DOWN_RNF_pval_imp$CT2[i])){
+		CT2RNF2_DOWN_RNF_pval_imp$CT2[i] <- CT2RNF2_DOWN_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF2_DOWN_RNF_pval_imp$CT3[i])){
+		CT2RNF2_DOWN_RNF_pval_imp$CT3[i] <- CT2RNF2_DOWN_RNF_pval_imp$LPA_mean_CT[i]
+	}
+}
+for(i in 1:nrow(CT2RNF2_DOWN_RNF_pval_imp)){
+	if(is.na(CT2RNF2_DOWN_RNF_pval_imp$RNF1[i])){
+		CT2RNF2_DOWN_RNF_pval_imp$RNF1[i] <- CT2RNF2_DOWN_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT2RNF2_DOWN_RNF_pval_imp$RNF2[i])){
+		CT2RNF2_DOWN_RNF_pval_imp$RNF2[i] <- CT2RNF2_DOWN_RNF_pval_imp$LPA_mean_RNF[i]
+	}else if(is.na(CT2RNF2_DOWN_RNF_pval_imp$RNF3[i])){
+		CT2RNF2_DOWN_RNF_pval_imp$RNF3[i] <- CT2RNF2_DOWN_RNF_pval_imp$LPA_mean_RNF[i]
+	}
+}
+```
+
+
+#### 1 RNF144b 1 CT
+
+```{r}
+CT1RNF1_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 2 & df_RNF_analysis$log2FC < 0, ]
+CT1RNF1_DOWN_RNF$LPA_mean_RNF <- apply(CT1RNF1_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, function(z) na.omit(z)[1])
+CT1RNF1_DOWN_RNF$LPA_sd_RNF <- NA
+CT1RNF1_DOWN_RNF$LPA_mean_CT <- apply(CT1RNF1_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1RNF1_DOWN_RNF$LPA_sd_CT <-  NA
+CT1RNF1_DOWN_RNF_1FC <- CT1RNF1_DOWN_RNF[CT1RNF1_DOWN_RNF$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 3 RNF144b 2 CT
+
+```{r}
+CT2RNF3_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$padj < 0.05, ]
+CT2RNF3_DOWN_RNF$LPA_mean_RNF <- rowMeans(CT2RNF3_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")])
+CT2RNF3_DOWN_RNF$LPA_sd_RNF <- apply(CT2RNF3_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT2RNF3_DOWN_RNF$LPA_mean_CT <- apply(CT2RNF3_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF3_DOWN_RNF$LPA_sd_CT <- apply(CT2RNF3_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2RNF3_DOWN_RNF_pval <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC < 0 & df_RNF_analysis$pvalue < 0.05, ]
+CT2RNF3_DOWN_RNF_pval$LPA_mean_RNF <- rowMeans(CT2RNF3_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")])
+CT2RNF3_DOWN_RNF_pval$LPA_sd_RNF <- apply(CT2RNF3_DOWN_RNF_pval[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT2RNF3_DOWN_RNF_pval$LPA_mean_CT <- apply(CT2RNF3_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2RNF3_DOWN_RNF_pval$LPA_sd_CT <- apply(CT2RNF3_DOWN_RNF_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+```{r}
+CT2RNF3_DOWN_RNF_pval_imp <- CT2RNF3_DOWN_RNF_pval
+if(nrow(CT2RNF3_DOWN_RNF_pval_imp) > 0){
+for(i in 1:nrow(CT2RNF3_DOWN_RNF_pval_imp)){
+	if(is.na(CT2RNF3_DOWN_RNF_pval_imp$CT1[i])){
+		CT2RNF3_DOWN_RNF_pval_imp$CT1[i] <- CT2RNF3_DOWN_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF3_DOWN_RNF_pval_imp$CT2[i])){
+		CT2RNF3_DOWN_RNF_pval_imp$CT2[i] <- CT2RNF3_DOWN_RNF_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2RNF3_DOWN_RNF_pval_imp$CT3[i])){
+		CT2RNF3_DOWN_RNF_pval_imp$CT3[i] <- CT2RNF3_DOWN_RNF_pval_imp$LPA_mean_CT[i]
+	}
+}
+}
+```
+
+
+#### 3 RNF144b 1 CT
+
+```{r}
+CT1RNF3_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 0 & df_RNF_analysis$log2FC < 0, ]
+CT1RNF3_DOWN_RNF$LPA_mean_RNF <- rowMeans(CT1RNF3_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")])
+CT1RNF3_DOWN_RNF$LPA_sd_RNF <- apply(CT1RNF3_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd)
+CT1RNF3_DOWN_RNF$LPA_mean_CT <- apply(CT1RNF3_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1RNF3_DOWN_RNF$LPA_sd_CT <- NA
+CT1RNF3_DOWN_RNF_1FC <- CT1RNF3_DOWN_RNF[CT1RNF3_DOWN_RNF$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 2 RNF144b 1 CT
+
+```{r}
+CT1RNF2_DOWN_RNF <- df_RNF_analysis[rowSums(is.na(df_RNF_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_RNF_analysis[,c("RNF1", "RNF2", "RNF3")])) == 1 & df_RNF_analysis$log2FC < 0, ]
+CT1RNF2_DOWN_RNF$LPA_mean_RNF <- apply(CT1RNF2_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, mean, na.rm = TRUE)
+CT1RNF2_DOWN_RNF$LPA_sd_RNF <- apply(CT1RNF2_DOWN_RNF[,c("RNF1", "RNF2", "RNF3")], 1, sd, na.rm = TRUE)
+CT1RNF2_DOWN_RNF$LPA_mean_CT <- apply(CT1RNF2_DOWN_RNF[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1RNF2_DOWN_RNF$LPA_sd_CT <- NA
+CT1RNF2_DOWN_RNF_1FC <- CT1RNF2_DOWN_RNF[CT1RNF2_DOWN_RNF$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+
+### FULL DATASETS DOWN
+Now we have created all the datasets for the up-regulated proteins, we can create a big dataset with all the proteins that are significantly under-expressed and those that are significant in terms of p-value.
+```{r}
+DOWN_RNF_permissive_list <- list(CT3RNF0_DOWN_RNF, CT2RNF0_DOWN_RNF, CT1RNF0_DOWN_RNF, CT1RNF3_DOWN_RNF, CT1RNF2_DOWN_RNF, CT2RNF3_DOWN_RNF_pval, CT3RNF3_DOWN_RNF_pval, CT2RNF2_DOWN_RNF_pval, CT1RNF1_DOWN_RNF, CT3RNF2_DOWN_RNF_pval, CT3RNF1_DOWN_RNF, CT2RNF1_DOWN_RNF)
+DOWN_RNF_permissive <- DOWN_RNF_permissive_list %>%
+	purrr::reduce(full_join)
+DOWN_RNF_reliable_list <- list(CT3RNF0_DOWN_RNF, CT2RNF0_DOWN_RNF, CT1RNF3_DOWN_RNF, CT2RNF3_DOWN_RNF_pval_imp, CT3RNF3_DOWN_RNF_pval, CT2RNF2_DOWN_RNF_pval_imp, CT3RNF2_DOWN_RNF_pval_imp, CT3RNF1_DOWN_RNF)
+DOWN_RNF_reliable <- DOWN_RNF_reliable_list %>%
+	purrr::reduce(full_join)
+```
+
+### Merging the datasets for UP & DOWN proteins
+
+```{r}
+UPDOWN_RNF <- rbind(UP_RNF_reliable, DOWN_RNF_reliable)
+```
+
+#### Column to classify the proteings by group
+```{r}
+UPDOWN_RNF$Subset <- NA
+for(uniprot in UPDOWN_RNF$ID){
+	if(uniprot %in% CT0RNF3_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT0RNF3"
+	}else if(uniprot %in% CT0RNF2_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT0RNF2"
+	}else if(uniprot %in% CT0RNF1_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT0RNF1"
+	}else if(uniprot %in% CT1RNF1_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF1"
+	}else if(uniprot %in% CT1RNF2_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF2"
+	}else if(uniprot %in% CT1RNF3_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF3"
+	}else if(uniprot %in% CT2RNF1_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF1"
+	}else if(uniprot %in% CT3RNF1_UP_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF1"
+	}else if(uniprot %in% CT2RNF2_UP_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF2"
+	}else if(uniprot %in% CT2RNF3_UP_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF3"
+	}else if(uniprot %in% CT3RNF2_UP_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF2"
+	}else if(uniprot %in% CT3RNF3_UP_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF3"
+	}else if(uniprot %in% CT3RNF0_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF0"
+	}else if(uniprot %in% CT2RNF0_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF0"
+	}else if(uniprot %in% CT1RNF0_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF0"
+	}else if(uniprot %in% CT1RNF1_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF1"
+	}else if(uniprot %in% CT1RNF2_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF2"
+	}else if(uniprot %in% CT1RNF3_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT1RNF3"
+	}else if(uniprot %in% CT2RNF1_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF1"
+	}else if(uniprot %in% CT3RNF1_DOWN_RNF$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF1"
+	}else if(uniprot %in% CT2RNF2_DOWN_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF2"
+	}else if(uniprot %in% CT2RNF3_DOWN_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT2RNF3"
+	}else if(uniprot %in% CT3RNF2_DOWN_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF2"
+	}else if(uniprot %in% CT3RNF3_DOWN_RNF_pval$ID){
+		UPDOWN_RNF$Subset[UPDOWN_RNF$ID == uniprot] <- "CT3RNF3"
+	}
+}
+UPDOWN_RNF <- UPDOWN_RNF %>%
+	relocate(Subset, .after = ID)
+UPDOWN_RNF$ID <- gsub("^CON_", "", UPDOWN_RNF$ID)
+```
+
+##### Calculate what percentage corresponds to 2vs0
+```{r}
+(sum(UPDOWN_RNF$Subset == "CT0RNF2" | UPDOWN_RNF$Subset == "CT2RNF0")/nrow(UPDOWN_RNF))*100
+```
+
+It corresponds to a 10% of the proteins, which is somehow acceptable.
+
+## More subsetting with RNF
+
+#### Creating the gene lists for GO analysis
+```{r}
+write.table(UPDOWN_RNF$ID, file=here("results", "proteomics", "prot_lists", "UPDOWN_RNF_pval005_lfc0.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+write.table(gsub("^CON_", "", all_data_df$Accession), file=here("results", "proteomics", "prot_lists", "Reference_prot_list.txt"),  sep = "\n", quote = F, row.names = F, col.names = F)
+## This list is used as input in the UNIPROTKB tool of ID mapping with the gene name: https://www.uniprot.org/id-mapping
+## Once the file is created, we create a new file with both UNIPROT and Gene names
+UPDOWN_RNF_UNIPROT_GENENAME <- read.delim(here("results", "proteomics","prot_lists","UPDOWN_imp_pval005_lfc0_UNIPROT_GENENAME.txt"), sep = c("\t"), header = TRUE)
+```
+
+#### Subsetting with FC
+```{r}
+## From what I have seen in the literature, the common thresholds used in a proteomics analysis in cancer are FC > 1.2 and FC > 1.5
+UPDOWN_RNF_FC1.2 <- UPDOWN_RNF[abs(UPDOWN_RNF$log2FC) > 0.26303440583379378, ] ## That number is the log2(1.2)
+UPDOWN_RNF_FC1.3 <- UPDOWN_RNF[abs(UPDOWN_RNF$log2FC) > 0.37851162325372983, ] ## That number is the log2(1.3)
+UPDOWN_RNF_FC1.5 <- UPDOWN_RNF[abs(UPDOWN_RNF$log2FC) > 0.58496250072115619, ] ## That number is the log2(1.5)
+```
+
+#### Subsetting with low confident subsets
+```{r}
+## As we mentioned previously, those subsets that contain only 1 replicate on one condition or one replicate in each are of low confidence, so we will discard them
+## This code should be used in case we use the absolute permissive dataset considering all subsets
+# UPDOWN_RNF_FC1.2_No1rep <- UPDOWN_RNF_FC1.2 %>%
+# 	dplyr::filter(!grepl("CT1RNF1|CT0RNF1|CT1RNF0", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+# UPDOWN_RNF_FC1.5_No1rep <- UPDOWN_RNF_FC1.5 %>%
+# 	dplyr::filter(!grepl("CT1RNF1|CT0RNF1|CT1RNF0", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+## With this subset we should calculate the mock logFC replacing the NAs with the minimum value of expression
+log2(min(na.omit(imp_info_df[,c("CT1_LPA", "CT2_LPA", "CT3_LPA", "RNF1_LPA", "RNF2_LPA", "RNF2_LPA")])))
+## Taking into account the minimum value of the 6 columns in terms of LPA, we will use this value in substitution of the NAs from the LPA columns
+## We will calculate a mock log2FC for all the proteins 
+UPDOWN_RNF_FC1.2_mockFC <- UPDOWN_RNF_FC1.2 %>%
+	dplyr::mutate(CT1 = replace_na(CT1, 17.201688324717672)) %>%
+	dplyr::mutate(CT2 = replace_na(CT2, 17.201688324717672)) %>%
+	dplyr::mutate(CT3 = replace_na(CT3, 17.201688324717672)) %>%
+	dplyr::mutate(RNF1 = replace_na(RNF1, 17.201688324717672)) %>%
+	dplyr::mutate(RNF2 = replace_na(RNF2, 17.201688324717672)) %>%
+	dplyr::mutate(RNF3 = replace_na(RNF3, 17.201688324717672)) %>%
+	rowwise() %>% 
+	mutate(RNF_mock_mean = mean(c(RNF1, RNF2, RNF3))) %>%
+	mutate(CT_mock_mean = mean(c(CT1, CT2, CT3))) %>%
+	transform(mock_logFC = RNF_mock_mean - CT_mock_mean) %>%
+	relocate(mock_logFC, .after = log2FC)
+write.table(UPDOWN_RNF_FC1.2_mockFC$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_RNF_fc1.2_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_RNF_FC1.3_mockFC <- UPDOWN_RNF_FC1.3 %>%
+	dplyr::mutate(CT1 = replace_na(CT1, 17.201688324717672)) %>%
+	dplyr::mutate(CT2 = replace_na(CT2, 17.201688324717672)) %>%
+	dplyr::mutate(CT3 = replace_na(CT3, 17.201688324717672)) %>%
+	dplyr::mutate(RNF1 = replace_na(RNF1, 17.201688324717672)) %>%
+	dplyr::mutate(RNF2 = replace_na(RNF2, 17.201688324717672)) %>%
+	dplyr::mutate(RNF3 = replace_na(RNF3, 17.201688324717672)) %>%
+	rowwise() %>% 
+	mutate(RNF_mock_mean = mean(c(RNF1, RNF2, RNF3))) %>%
+	mutate(CT_mock_mean = mean(c(CT1, CT2, CT3))) %>%
+	transform(mock_logFC = RNF_mock_mean - CT_mock_mean) %>%
+	relocate(mock_logFC, .after = log2FC)
+write.table(UPDOWN_RNF_FC1.3_mockFC$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_RNF_fc1.3_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_RNF_FC1.5_mockFC <- UPDOWN_RNF_FC1.5 %>%
+	dplyr::mutate(CT1 = replace_na(CT1, 17.201688324717672)) %>%
+	dplyr::mutate(CT2 = replace_na(CT2, 17.201688324717672)) %>%
+	dplyr::mutate(CT3 = replace_na(CT3, 17.201688324717672)) %>%
+	dplyr::mutate(RNF1 = replace_na(RNF1, 17.201688324717672)) %>%
+	dplyr::mutate(RNF2 = replace_na(RNF2, 17.201688324717672)) %>%
+	dplyr::mutate(RNF3 = replace_na(RNF3, 17.201688324717672)) %>%
+	rowwise() %>% 
+	mutate(RNF_mock_mean = mean(c(RNF1, RNF2, RNF3))) %>%
+	mutate(CT_mock_mean = mean(c(CT1, CT2, CT3))) %>%
+	transform(mock_logFC = RNF_mock_mean - CT_mock_mean) %>%
+	relocate(mock_logFC, .after = log2FC)
+write.table(UPDOWN_RNF_FC1.5_mockFC$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_RNF_fc1.5_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+## Now we have the mock FC for a mock ranking of the proteins, let's subset in terms of confidence. We will consider all genes in these datsets as "significant" or "somehow reliable" since they appear in, at least, 3 replicates from the 6.
+## We will keep the subset only with those with at least 4 replicates from the 6
+# UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 <- UPDOWN_RNF_FC1.2_No1rep_mockFC %>%
+# 	dplyr::filter(!grepl("CT2RNF1|CT1RNF2", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+# write.table(UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1$ID, file=here("output", "prot_lists", "UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+# write.table(UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1$ID[order(abs(UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1$mock_logFC), decreasing = TRUE)], file=here("output", "prot_lists", "mockranked_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+# UPDOWN_RNF_FC1.5_No1rep_mockFC_no2vs1 <- UPDOWN_RNF_FC1.5_No1rep_mockFC %>%
+# 	dplyr::filter(!grepl("CT2RNF1|CT1RNF2", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+# write.table(UPDOWN_RNF_FC1.5_No1rep_mockFC_no2vs1$ID, file=here("output", "prot_lists", "UPDOWN_RNF_FC1.5_No1rep_mockFC_no2vs1.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+```
+
+There is a paper: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9218934/. which spotlights this fact of having a presence of at least 50% of the samples and a at least one unique peptide.
+
+#### No NAs in pvalue filtering
+```{r}
+## In order to be super strict with the filtering, I will remove all those datasets with no significance parameter, which are those that have only one replicate in one of the two conditions. In this way, we are removing too much information I think. However, we will see the results we obtain from that
+UPDOWN_RNF_FC1.2_sig <- UPDOWN_RNF_FC1.2_mockFC %>%
+	dplyr::filter(!is.na(pvalue))
+write.table(UPDOWN_RNF_FC1.2_sig$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_RNF_pval005_lfc1.2_sig.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_RNF_FC1.3_sig <- UPDOWN_RNF_FC1.3_mockFC %>%
+	dplyr::filter(!is.na(pvalue))
+write.table(UPDOWN_RNF_FC1.3_sig$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_RNF_pval005_lfc1.3_sig.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_RNF_FC1.5_sig <- UPDOWN_RNF_FC1.5_mockFC %>%
+	dplyr::filter(!is.na(pvalue))
+write.table(UPDOWN_RNF_FC1.5_sig$ID, file=here("results", "proteomics", "prot_lists", "UPDOWN_RNF_pval005_lfc1.5_sig.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+```
+
+```{r}
+UPDOWN_RNF_FC1.5_sig %>% 
+	ggplot(aes(x = mock_logFC, 
+                y = -log10(padj))) +
+  geom_point(alpha=0.4, size=2.5) +
+  scale_color_manual(values=c("blue", "grey","red"))+
+  xlim(c(-10, 10)) +
+  geom_vline(xintercept=c(-1,1),lty=4,col="black",lwd=0.8) +
+  geom_hline(yintercept = 1.301,lty=4,col="black",lwd=0.8) +
+  labs(x="log2(fold change)",
+       y="-log10 (adj.p-value)",
+       title="Differential expression")  +
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position="right", 
+        legend.title = element_blank())
+```
+
+
+# p53
+
+## UP: over-expressed proteins 
+
+### Building of the purified datasets
+
+The datasets will be built based on importance. After that, the lists of proteins will be used for functional and enrichment analysis.
+
+#### 3 p53144b 0 CT
+Proteins found in 3 replicates of p53144b and 0 of controls. No significance parameter can be retrieved from these proteins, however, the mean of Log2 Protein Abundance and Standard deviation of this parameter can be calculated. These proteins will be considered those of major relevance since they are clearly expressed in our "treated" samples and not in the controls, suggesting that they might be over-expressed due to a lack of p53144b. Maybe for the role of p53144b as a E3 Ub-ligase and its direct effect under this protein, or an indirect effect to a protein that regulates somehow these proteins:
+```{r}
+CT0p533_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 3 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0, ]
+CT0p533_UP_p53$LPA_mean_p53 <- rowMeans(CT0p533_UP_p53[,c("p531", "p532", "p533")])
+CT0p533_UP_p53$LPA_sd_p53 <- apply(CT0p533_UP_p53[,c("p531", "p532", "p533")], 1, sd)
+CT0p533_UP_p53$LPA_mean_CT <- NA
+CT0p533_UP_p53$LPA_sd_CT <- NA
+```
+
+#### 2 p53144b 0 CT
+
+```{r}
+CT0p532_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 3 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1, ]
+CT0p532_UP_p53$LPA_mean_p53 <- apply(CT0p532_UP_p53[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT0p532_UP_p53$LPA_sd_p53 <- apply(CT0p532_UP_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT0p532_UP_p53$LPA_mean_CT <- NA
+CT0p532_UP_p53$LPA_sd_CT <- NA
+```
+
+#### 1 p53144b 0 CT
+
+```{r}
+CT0p531_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 3 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2, ]
+## We will create a column that says mean, however, this is not the real mean of the value, since it is just the unique value within the replicates, and no sd will be calculated
+CT0p531_UP_p53$LPA_mean_p53 <- apply(CT0p531_UP_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT0p531_UP_p53$LPA_sd_p53 <- NA
+## Now we have the "mean" value of abundance, we can compute the range to see if this expression values are big enough to take them into consideration
+range(CT0p531_UP_p53$LPA_mean)
+CT0p531_UP_p53$LPA_mean_CT <- NA
+CT0p531_UP_p53$LPA_sd_CT <- NA
+```
+Maybe the min value can be deprecated, but a value of 25 may involve some kind of importance. However, we will discard those proteins with no significance since they are not really reliable. In fact, for some of the subsets, we will discard those proteins with presence only in 1 replicate.
+
+#### 3 p53144b 1 CT
+
+Now we start obtaining logFC values, so, we need to take into account those logFC with a positive value. However, we do not obtain a significance value, this involves that despite we obtain a logFC value, it might not be significant. For that reason, we should apply a cut-off in terms of logFC to avoid filling the list with False Positives. We will keep a dataset with all positive logFC and then we will filter another dataset with proteins with at least 1 logFC:
+```{r}
+CT1p533_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC > 0, ]
+CT1p533_UP_p53$LPA_mean_p53 <- rowMeans(CT1p533_UP_p53[,c("p531", "p532", "p533")])
+CT1p533_UP_p53$LPA_sd_p53 <- apply(CT1p533_UP_p53[,c("p531", "p532", "p533")], 1, sd)
+CT1p533_UP_p53$LPA_mean_CT <- apply(CT1p533_UP_p53[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1p533_UP_p53$LPA_sd_CT <- NA
+CT1p533_UP_p53_1FC <- CT1p533_UP_p53[CT1p533_UP_p53$log2FC > 1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+Even though there are samples with only 1 replicate, since we find presence in the three replicates in the other condition we will consider these proteins as a similar confidence than those in 3vs0, despite not obtaining a significance value. For those proteins with a negative logFC in this subset we will consider the NAs in the CT condition with the minimum value since it would not be reliable to consider those as with a higher expression in the control since two replicates have a lack of expression.
+
+#### 2 p53144b 1 CT
+
+```{r}
+CT1p532_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC > 0, ]
+CT1p532_UP_p53$LPA_mean_p53 <- apply(CT1p532_UP_p53[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT1p532_UP_p53$LPA_sd_p53 <- apply(CT1p532_UP_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT1p532_UP_p53$LPA_mean_CT <- apply(CT1p532_UP_p53[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1p532_UP_p53$LPA_sd_CT <- NA
+CT1p532_UP_p53_1FC <- CT1p532_UP_p53[CT1p532_UP_p53$log2FC > 1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+Similar reasoning as the previous subset.
+
+#### 3 p53144b 2 CT
+
+Now we start obtaining logFC values, so, we need to take into account those logFC with a positive value. In addition, we start to have significance values, thus, we will consider as significant those proteins with a padj < 0.05. However, in case we find no significant results, we might include those proteins with a pvalue < 0.05. In more strict subsets, based on the literature, we will consider a FC > 1.5 as a cutoff. It is extracted from the following paper: Integrated microbiome, metabolome, and proteome analysis identifies a novel interplay among commensal bacteria, metabolites and candidate targets in non‐small cell lung cancer or 1.2 in USP35 mitigates endoplasmic reticulum stress-induced apoptosis by stabilizing RRBP1 in non-small cell lung cancer
+```{r}
+CT2p533_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC > 0 & df_p53_analysis$padj < 0.05, ]
+CT2p533_UP_p53$LPA_mean_p53 <- rowMeans(CT2p533_UP_p53[,c("p531", "p532", "p533")])
+CT2p533_UP_p53$LPA_sd_p53 <- apply(CT2p533_UP_p53[,c("p531", "p532", "p533")], 1, sd)
+CT2p533_UP_p53$LPA_mean_CT <- apply(CT2p533_UP_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p533_UP_p53$LPA_sd_CT <- apply(CT2p533_UP_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2p533_UP_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC > 0 & df_p53_analysis$pvalue < 0.05, ]
+CT2p533_UP_p53_pval$LPA_mean_p53 <- rowMeans(CT2p533_UP_p53_pval[,c("p531", "p532", "p533")])
+CT2p533_UP_p53_pval$LPA_sd_p53 <- apply(CT2p533_UP_p53_pval[,c("p531", "p532", "p533")], 1, sd)
+CT2p533_UP_p53_pval$LPA_mean_CT <- apply(CT2p533_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p533_UP_p53_pval$LPA_sd_CT <- apply(CT2p533_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+##### Imputation of missing values with mean within condition
+```{r}
+CT2p533_UP_p53_pval_imp <- CT2p533_UP_p53_pval
+for(i in 1:nrow(CT2p533_UP_p53_pval_imp)){
+	if(is.na(CT2p533_UP_p53_pval_imp$CT1[i])){
+		CT2p533_UP_p53_pval_imp$CT1[i] <- CT2p533_UP_p53_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2p533_UP_p53_pval_imp$CT2[i])){
+		CT2p533_UP_p53_pval_imp$CT2[i] <- CT2p533_UP_p53_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2p533_UP_p53_pval_imp$CT3[i])){
+		CT2p533_UP_p53_pval_imp$CT3[i] <- CT2p533_UP_p53_pval_imp$LPA_mean_CT[i]
+	}
+}
+```
+
+
+#### 3 p53144b 3 CT
+
+Same as the previous dataset
+```{r}
+CT3p533_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC > 0 & df_p53_analysis$padj < 0.05, ]
+CT3p533_UP_p53$LPA_mean_p53 <- rowMeans(CT3p533_UP_p53[,c("p531", "p532", "p533")])
+CT3p533_UP_p53$LPA_sd_p53 <- apply(CT3p533_UP_p53[,c("p531", "p532", "p533")], 1, sd)
+CT3p533_UP_p53$LPA_mean_CT <- rowMeans(CT3p533_UP_p53[,c("CT1", "CT2", "CT3")])
+CT3p533_UP_p53$LPA_sd_CT <- apply(CT3p533_UP_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3p533_UP_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC > 0 & df_p53_analysis$pvalue < 0.05, ]
+CT3p533_UP_p53_pval$LPA_mean_p53 <- rowMeans(CT3p533_UP_p53_pval[,c("p531", "p532", "p533")])
+CT3p533_UP_p53_pval$LPA_sd_p53 <- apply(CT3p533_UP_p53_pval[,c("p531", "p532", "p533")], 1, sd)
+CT3p533_UP_p53_pval$LPA_mean_CT <- rowMeans(CT3p533_UP_p53_pval[,c("CT1", "CT2", "CT3")])
+CT3p533_UP_p53_pval$LPA_sd_CT <- apply(CT3p533_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+#### 2 p53144b 2 CT
+
+Same as the previous dataset
+```{r}
+CT2p532_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC > 0 & df_p53_analysis$padj < 0.05, ]
+CT2p532_UP_p53$LPA_mean_p53 <- apply(CT2p532_UP_p53[,c("p531", "p532", "p533")],1, mean, na.rm = TRUE)
+CT2p532_UP_p53$LPA_sd_p53 <- apply(CT2p532_UP_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT2p532_UP_p53$LPA_mean_CT <- apply(CT2p532_UP_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p532_UP_p53$LPA_sd_CT <- apply(CT2p532_UP_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2p532_UP_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC > 0 & df_p53_analysis$pvalue < 0.05, ]
+CT2p532_UP_p53_pval$LPA_mean_p53 <- apply(CT2p532_UP_p53_pval[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT2p532_UP_p53_pval$LPA_sd_p53 <- apply(CT2p532_UP_p53_pval[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT2p532_UP_p53_pval$LPA_mean_CT <- apply(CT2p532_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p532_UP_p53_pval$LPA_sd_CT <- apply(CT2p532_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+```{r}
+CT2p532_UP_p53_pval_imp <- CT2p532_UP_p53_pval
+for(i in 1:nrow(CT2p532_UP_p53_pval_imp)){
+	if(is.na(CT2p532_UP_p53_pval_imp$CT1[i])){
+		CT2p532_UP_p53_pval_imp$CT1[i] <- CT2p532_UP_p53_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2p532_UP_p53_pval_imp$CT2[i])){
+		CT2p532_UP_p53_pval_imp$CT2[i] <- CT2p532_UP_p53_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2p532_UP_p53_pval_imp$CT3[i])){
+		CT2p532_UP_p53_pval_imp$CT3[i] <- CT2p532_UP_p53_pval_imp$LPA_mean_CT[i]
+	}
+}
+for(i in 1:nrow(CT2p532_UP_p53_pval_imp)){
+	if(is.na(CT2p532_UP_p53_pval_imp$p531[i])){
+		CT2p532_UP_p53_pval_imp$p531[i] <- CT2p532_UP_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT2p532_UP_p53_pval_imp$p532[i])){
+		CT2p532_UP_p53_pval_imp$p532[i] <- CT2p532_UP_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT2p532_UP_p53_pval_imp$p533[i])){
+		CT2p532_UP_p53_pval_imp$p533[i] <- CT2p532_UP_p53_pval_imp$LPA_mean_p53[i]
+	}
+}
+```
+
+
+#### 1 p53144b 1 CT
+
+We will not really rely on this dataset
+```{r}
+CT1p531_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2 & df_p53_analysis$log2FC > 0, ]
+CT1p531_UP_p53$LPA_mean_p53 <- apply(CT1p531_UP_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT1p531_UP_p53$LPA_sd_p53 <- NA
+CT1p531_UP_p53$LPA_mean_CT <- apply(CT1p531_UP_p53[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1p531_UP_p53$LPA_sd_CT <- NA
+CT1p531_UP_p53_1FC <- CT1p531_UP_p53[CT1p531_UP_p53$log2FC > 1,]
+```
+
+#### 2 p53144b 3 CT
+
+Now, we will consider those proteins that are found in more replicates of the controls than on those of the p53, but have a positive logFC:
+```{r}
+CT3p532_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC > 0 & df_p53_analysis$padj < 0.05, ]
+CT3p532_UP_p53$LPA_mean_p53 <- apply(CT3p532_UP_p53[,c("p531", "p532", "p533")],1, mean, na.rm = TRUE)
+CT3p532_UP_p53$LPA_sd_p53 <- apply(CT3p532_UP_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT3p532_UP_p53$LPA_mean_CT <- apply(CT3p532_UP_p53[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p532_UP_p53$LPA_sd_CT <- apply(CT3p532_UP_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3p532_UP_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC > 0 & df_p53_analysis$pvalue < 0.05, ]
+CT3p532_UP_p53_pval$LPA_mean_p53 <- apply(CT3p532_UP_p53_pval[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT3p532_UP_p53_pval$LPA_sd_p53 <- apply(CT3p532_UP_p53_pval[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT3p532_UP_p53_pval$LPA_mean_CT <- apply(CT3p532_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p532_UP_p53_pval$LPA_sd_CT <- apply(CT3p532_UP_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+```{r}
+CT3p532_UP_p53_pval_imp <- CT3p532_UP_p53_pval
+for(i in 1:nrow(CT3p532_UP_p53_pval_imp)){
+	if(is.na(CT3p532_UP_p53_pval_imp$p531[i])){
+		CT3p532_UP_p53_pval_imp$p531[i] <- CT3p532_UP_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT3p532_UP_p53_pval_imp$p532[i])){
+		CT3p532_UP_p53_pval_imp$p532[i] <- CT3p532_UP_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT3p532_UP_p53_pval_imp$p533[i])){
+		CT3p532_UP_p53_pval_imp$p533[i] <- CT3p532_UP_p53_pval_imp$LPA_mean_p53[i]
+	}
+}
+```
+
+
+#### 1 p53144b 3 CT
+
+In this case, those proteins that are positive in this dataset will be changed so that they acquire a negative logFC since it is weird to obtain a positive FC with only presence of the protein in one replicate of p53 and 3 of CT.
+```{r}
+CT3p531_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2 & df_p53_analysis$log2FC > 0, ]
+CT3p531_UP_p53$LPA_mean_p53 <- apply(CT3p531_UP_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT3p531_UP_p53$LPA_sd_p53 <- NA
+CT3p531_UP_p53$LPA_mean_CT <- apply(CT3p531_UP_p53[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p531_UP_p53$LPA_sd_CT <- apply(CT3p531_UP_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3p531_UP_p53_1FC <- CT3p531_UP_p53[CT3p531_UP_p53$log2FC > 1,]
+```
+
+#### 1 p53144b 2 CT
+
+Same reasoning as the previous dataset
+```{r}
+CT2p531_UP_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2 & df_p53_analysis$log2FC > 0, ]
+CT2p531_UP_p53$LPA_mean_p53 <- apply(CT2p531_UP_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT2p531_UP_p53$LPA_sd_p53 <- NA
+CT2p531_UP_p53$LPA_mean_CT <- apply(CT2p531_UP_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p531_UP_p53$LPA_sd_CT <- apply(CT2p531_UP_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2p531_UP_p53_1FC <- CT2p531_UP_p53[CT2p531_UP_p53$log2FC > 1,]
+```
+
+### FULL DATASET UP
+Now we have created all the datasets for the up-regulated proteins, we can create a big dataset with all the proteins that are significantly over-expressed in terms of p-value.
+```{r}
+## Dataset with ALL proteins from ALL subsets that are OVER-EXPRESSED with a logFC cutoff of > 0 and a p-value < 0.05
+UP_p53_permissive_list <- list(CT0p533_UP_p53, CT0p532_UP_p53, CT0p531_UP_p53, CT1p533_UP_p53, CT1p532_UP_p53, CT2p533_UP_p53_pval, CT3p533_UP_p53_pval, CT2p532_UP_p53_pval, CT1p531_UP_p53, CT3p532_UP_p53_pval, CT3p531_UP_p53, CT2p531_UP_p53)
+UP_p53_permissive <- UP_p53_permissive_list %>%
+	purrr::reduce(full_join)
+UP_p53_reliable_list <- list(CT0p533_UP_p53, CT0p532_UP_p53, CT1p533_UP_p53, CT2p533_UP_p53_pval_imp, CT3p533_UP_p53_pval, CT2p532_UP_p53_pval_imp, CT3p532_UP_p53_pval_imp, CT3p531_UP_p53)
+UP_p53_reliable <- UP_p53_reliable_list %>%
+	purrr::reduce(full_join)
+```
+
+## DOWN: down-expressed proteins
+
+### Building of the purified datasets
+
+Same procedure as before, but for the down regulated genes:
+	
+#### 0 p53144b 3 CT
+	
+```{r}
+CT3p530_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 3, ]
+CT3p530_DOWN_p53$LPA_mean_p53 <- NA
+CT3p530_DOWN_p53$LPA_sd_p53 <- NA
+CT3p530_DOWN_p53$LPA_mean_CT <- rowMeans(CT3p530_DOWN_p53[,c("CT1", "CT2", "CT3")])
+CT3p530_DOWN_p53$LPA_sd_CT <- apply(CT3p530_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+#### 0 p53144b 2 CT
+
+```{r}
+CT2p530_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 3, ]
+CT2p530_DOWN_p53$LPA_mean_p53 <- NA
+CT2p530_DOWN_p53$LPA_sd_p53 <- NA
+CT2p530_DOWN_p53$LPA_mean_CT <- apply(CT2p530_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p530_DOWN_p53$LPA_sd_CT <- apply(CT2p530_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+#### 0 p53144b 1 CT
+
+```{r}
+CT1p530_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 3, ]
+CT1p530_DOWN_p53$LPA_mean_p53 <- NA
+CT1p530_DOWN_p53$LPA_sd_p53 <- NA
+CT1p530_DOWN_p53$LPA_mean_CT <- apply(CT1p530_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT1p530_DOWN_p53$LPA_sd_CT <- apply(CT1p530_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+#### 1 p53144b 3 CT
+
+```{r}
+CT3p531_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2 & df_p53_analysis$log2FC < 0, ]
+CT3p531_DOWN_p53$LPA_mean_p53 <- apply(CT3p531_DOWN_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT3p531_DOWN_p53$LPA_sd_p53 <- NA
+CT3p531_DOWN_p53$LPA_mean_CT <- apply(CT3p531_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p531_DOWN_p53$LPA_sd_CT <- apply(CT3p531_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3p531_DOWN_p53_1FC <- CT3p531_DOWN_p53[CT3p531_DOWN_p53$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 1 p53144b 2 CT
+
+```{r}
+CT2p531_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2 & df_p53_analysis$log2FC < 0, ]
+CT2p531_DOWN_p53$LPA_mean_p53 <- apply(CT2p531_DOWN_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT2p531_DOWN_p53$LPA_sd_p53 <- NA
+CT2p531_DOWN_p53$LPA_mean_CT <- apply(CT2p531_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p531_DOWN_p53$LPA_sd_CT <- apply(CT2p531_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2p531_DOWN_p53_1FC <- CT2p531_DOWN_p53[CT2p531_DOWN_p53$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 2 p53144b 3 CT
+
+```{r}
+CT3p532_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC < 0 & df_p53_analysis$padj < 0.05, ]
+CT3p532_DOWN_p53$LPA_mean_p53 <- apply(CT3p532_DOWN_p53[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT3p532_DOWN_p53$LPA_sd_p53 <- apply(CT3p532_DOWN_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT3p532_DOWN_p53$LPA_mean_CT <- apply(CT3p532_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p532_DOWN_p53$LPA_sd_CT <- apply(CT3p532_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3p532_DOWN_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC < 0 & df_p53_analysis$pvalue < 0.05, ]
+CT3p532_DOWN_p53_pval$LPA_mean_p53 <- apply(CT3p532_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT3p532_DOWN_p53_pval$LPA_sd_p53 <- apply(CT3p532_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT3p532_DOWN_p53_pval$LPA_mean_CT <- apply(CT3p532_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p532_DOWN_p53_pval$LPA_sd_CT <- apply(CT3p532_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+```{r}
+CT3p532_DOWN_p53_pval_imp <- CT3p532_DOWN_p53_pval
+for(i in 1:nrow(CT3p532_DOWN_p53_pval_imp)){
+	if(is.na(CT3p532_DOWN_p53_pval_imp$p531[i])){
+		CT3p532_DOWN_p53_pval_imp$p531[i] <- CT3p532_DOWN_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT3p532_DOWN_p53_pval_imp$p532[i])){
+		CT3p532_DOWN_p53_pval_imp$p532[i] <- CT3p532_DOWN_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT3p532_DOWN_p53_pval_imp$p533[i])){
+		CT3p532_DOWN_p53_pval_imp$p533[i] <- CT3p532_DOWN_p53_pval_imp$LPA_mean_p53[i]
+	}
+}
+```
+
+
+#### 3 p53144b 3 CT
+
+```{r}
+CT3p533_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC < 0 & df_p53_analysis$padj < 0.05, ]
+CT3p533_DOWN_p53$LPA_mean_p53 <- apply(CT3p533_DOWN_p53[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT3p533_DOWN_p53$LPA_sd_p53 <- apply(CT3p533_DOWN_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT3p533_DOWN_p53$LPA_mean_CT <- apply(CT3p533_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p533_DOWN_p53$LPA_sd_CT <- apply(CT3p533_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd)
+CT3p533_DOWN_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 0 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC < 0 & df_p53_analysis$pvalue < 0.05, ]
+CT3p533_DOWN_p53_pval$LPA_mean_p53 <- apply(CT3p533_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT3p533_DOWN_p53_pval$LPA_sd_p53 <- apply(CT3p533_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT3p533_DOWN_p53_pval$LPA_mean_CT <- apply(CT3p533_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean)
+CT3p533_DOWN_p53_pval$LPA_sd_CT <- apply(CT3p533_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd)
+```
+
+#### 2 p53144b 2 CT
+
+```{r}
+CT2p532_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC < 0 & df_p53_analysis$padj < 0.05, ]
+CT2p532_DOWN_p53$LPA_mean_p53 <- apply(CT2p532_DOWN_p53[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT2p532_DOWN_p53$LPA_sd_p53 <- apply(CT2p532_DOWN_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT2p532_DOWN_p53$LPA_mean_CT <- apply(CT2p532_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p532_DOWN_p53$LPA_sd_CT <- apply(CT2p532_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2p532_DOWN_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC < 0 & df_p53_analysis$pvalue < 0.05, ]
+CT2p532_DOWN_p53_pval$LPA_mean_p53 <- apply(CT2p532_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT2p532_DOWN_p53_pval$LPA_sd_p53 <- apply(CT2p532_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT2p532_DOWN_p53_pval$LPA_mean_CT <- apply(CT2p532_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p532_DOWN_p53_pval$LPA_sd_CT <- apply(CT2p532_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+```{r}
+CT2p532_DOWN_p53_pval_imp <- CT2p532_DOWN_p53_pval
+for(i in 1:nrow(CT2p532_DOWN_p53_pval_imp)){
+	if(is.na(CT2p532_DOWN_p53_pval_imp$CT1[i])){
+		CT2p532_DOWN_p53_pval_imp$CT1[i] <- CT2p532_DOWN_p53_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2p532_DOWN_p53_pval_imp$CT2[i])){
+		CT2p532_DOWN_p53_pval_imp$CT2[i] <- CT2p532_DOWN_p53_pval_imp$LPA_mean_CT[i]
+	}else if(is.na(CT2p532_DOWN_p53_pval_imp$CT3[i])){
+		CT2p532_DOWN_p53_pval_imp$CT3[i] <- CT2p532_DOWN_p53_pval_imp$LPA_mean_CT[i]
+	}
+}
+for(i in 1:nrow(CT2p532_DOWN_p53_pval_imp)){
+	if(is.na(CT2p532_DOWN_p53_pval_imp$p531[i])){
+		CT2p532_DOWN_p53_pval_imp$p531[i] <- CT2p532_DOWN_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT2p532_DOWN_p53_pval_imp$p532[i])){
+		CT2p532_DOWN_p53_pval_imp$p532[i] <- CT2p532_DOWN_p53_pval_imp$LPA_mean_p53[i]
+	}else if(is.na(CT2p532_DOWN_p53_pval_imp$p533[i])){
+		CT2p532_DOWN_p53_pval_imp$p533[i] <- CT2p532_DOWN_p53_pval_imp$LPA_mean_p53[i]
+	}
+}
+```
+
+
+#### 1 p53144b 1 CT
+
+```{r}
+CT1p531_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 2 & df_p53_analysis$log2FC < 0, ]
+CT1p531_DOWN_p53$LPA_mean_p53 <- apply(CT1p531_DOWN_p53[,c("p531", "p532", "p533")], 1, function(z) na.omit(z)[1])
+CT1p531_DOWN_p53$LPA_sd_p53 <- NA
+CT1p531_DOWN_p53$LPA_mean_CT <- apply(CT1p531_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1p531_DOWN_p53$LPA_sd_CT <-  NA
+CT1p531_DOWN_p53_1FC <- CT1p531_DOWN_p53[CT1p531_DOWN_p53$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 3 p53144b 2 CT
+
+```{r}
+CT2p533_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC < 0 & df_p53_analysis$padj < 0.05, ]
+CT2p533_DOWN_p53$LPA_mean_p53 <- rowMeans(CT2p533_DOWN_p53[,c("p531", "p532", "p533")])
+CT2p533_DOWN_p53$LPA_sd_p53 <- apply(CT2p533_DOWN_p53[,c("p531", "p532", "p533")], 1, sd)
+CT2p533_DOWN_p53$LPA_mean_CT <- apply(CT2p533_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p533_DOWN_p53$LPA_sd_CT <- apply(CT2p533_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+CT2p533_DOWN_p53_pval <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 1 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC < 0 & df_p53_analysis$pvalue < 0.05, ]
+CT2p533_DOWN_p53_pval$LPA_mean_p53 <- rowMeans(CT2p533_DOWN_p53_pval[,c("p531", "p532", "p533")])
+CT2p533_DOWN_p53_pval$LPA_sd_p53 <- apply(CT2p533_DOWN_p53_pval[,c("p531", "p532", "p533")], 1, sd)
+CT2p533_DOWN_p53_pval$LPA_mean_CT <- apply(CT2p533_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, mean, na.rm = TRUE)
+CT2p533_DOWN_p53_pval$LPA_sd_CT <- apply(CT2p533_DOWN_p53_pval[,c("CT1", "CT2", "CT3")], 1, sd, na.rm = TRUE)
+```
+
+```{r}
+CT2p533_DOWN_p53_pval_imp <- CT2p533_DOWN_p53_pval
+if(nrow(CT2p533_DOWN_p53_pval_imp) > 0){
+	for(i in 1:nrow(CT2p533_DOWN_p53_pval_imp)){
+		if(is.na(CT2p533_DOWN_p53_pval_imp$CT1[i])){
+			CT2p533_DOWN_p53_pval_imp$CT1[i] <- CT2p533_DOWN_p53_pval_imp$LPA_mean_CT[i]
+		}else if(is.na(CT2p533_DOWN_p53_pval_imp$CT2[i])){
+			CT2p533_DOWN_p53_pval_imp$CT2[i] <- CT2p533_DOWN_p53_pval_imp$LPA_mean_CT[i]
+		}else if(is.na(CT2p533_DOWN_p53_pval_imp$CT3[i])){
+			CT2p533_DOWN_p53_pval_imp$CT3[i] <- CT2p533_DOWN_p53_pval_imp$LPA_mean_CT[i]
+		}
+	}
+}
+```
+
+
+#### 3 p53144b 1 CT
+
+```{r}
+CT1p533_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 0 & df_p53_analysis$log2FC < 0, ]
+CT1p533_DOWN_p53$LPA_mean_p53 <- rowMeans(CT1p533_DOWN_p53[,c("p531", "p532", "p533")])
+CT1p533_DOWN_p53$LPA_sd_p53 <- apply(CT1p533_DOWN_p53[,c("p531", "p532", "p533")], 1, sd)
+CT1p533_DOWN_p53$LPA_mean_CT <- apply(CT1p533_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1p533_DOWN_p53$LPA_sd_CT <- NA
+CT1p533_DOWN_p53_1FC <- CT1p533_DOWN_p53[CT1p533_DOWN_p53$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+#### 2 p53144b 1 CT
+
+```{r}
+CT1p532_DOWN_p53 <- df_p53_analysis[rowSums(is.na(df_p53_analysis[,c("CT1", "CT2", "CT3")])) == 2 & rowSums(is.na(df_p53_analysis[,c("p531", "p532", "p533")])) == 1 & df_p53_analysis$log2FC < 0, ]
+CT1p532_DOWN_p53$LPA_mean_p53 <- apply(CT1p532_DOWN_p53[,c("p531", "p532", "p533")], 1, mean, na.rm = TRUE)
+CT1p532_DOWN_p53$LPA_sd_p53 <- apply(CT1p532_DOWN_p53[,c("p531", "p532", "p533")], 1, sd, na.rm = TRUE)
+CT1p532_DOWN_p53$LPA_mean_CT <- apply(CT1p532_DOWN_p53[,c("CT1", "CT2", "CT3")], 1, function(z) na.omit(z)[1])
+CT1p532_DOWN_p53$LPA_sd_CT <- NA
+CT1p532_DOWN_p53_1FC <- CT1p532_DOWN_p53[CT1p532_DOWN_p53$log2FC < -1,] ## We will consider this dataset, and in case we do not find results, we may use a lower cut-off or consider them all
+```
+
+
+### FULL DATASETS DOWN
+Now we have created all the datasets for the up-regulated proteins, we can create a big dataset with all the proteins that are significantly under-expressed and those that are significant in terms of p-value.
+```{r}
+DOWN_p53_permissive_list <- list(CT3p530_DOWN_p53, CT2p530_DOWN_p53, CT1p530_DOWN_p53, CT1p533_DOWN_p53, CT1p532_DOWN_p53, CT2p533_DOWN_p53_pval, CT3p533_DOWN_p53_pval, CT2p532_DOWN_p53_pval, CT1p531_DOWN_p53, CT3p532_DOWN_p53_pval, CT3p531_DOWN_p53, CT2p531_DOWN_p53)
+DOWN_p53_permissive <- DOWN_p53_permissive_list %>%
+	purrr::reduce(full_join)
+DOWN_p53_reliable_list <- list(CT3p530_DOWN_p53, CT2p530_DOWN_p53, CT1p533_DOWN_p53, CT2p533_DOWN_p53_pval_imp, CT3p533_DOWN_p53_pval, CT2p532_DOWN_p53_pval_imp, CT3p532_DOWN_p53_pval_imp, CT3p531_DOWN_p53)
+DOWN_p53_reliable <- DOWN_p53_reliable_list %>%
+	purrr::reduce(full_join)
+```
+
+### Merging the datasets for UP & DOWN proteins
+
+```{r}
+UPDOWN_p53 <- rbind(UP_p53_reliable, DOWN_p53_reliable)
+```
+
+#### Column to classify the proteings by group
+```{r}
+UPDOWN_p53$Subset <- NA
+for(uniprot in UPDOWN_p53$ID){
+	if(uniprot %in% CT0p533_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT0p533"
+	}else if(uniprot %in% CT0p532_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT0p532"
+	}else if(uniprot %in% CT0p531_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT0p531"
+	}else if(uniprot %in% CT1p531_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p531"
+	}else if(uniprot %in% CT1p532_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p532"
+	}else if(uniprot %in% CT1p533_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p533"
+	}else if(uniprot %in% CT2p531_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p531"
+	}else if(uniprot %in% CT3p531_UP_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p531"
+	}else if(uniprot %in% CT2p532_UP_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p532"
+	}else if(uniprot %in% CT2p533_UP_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p533"
+	}else if(uniprot %in% CT3p532_UP_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p532"
+	}else if(uniprot %in% CT3p533_UP_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p533"
+	}else if(uniprot %in% CT3p530_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p530"
+	}else if(uniprot %in% CT2p530_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p530"
+	}else if(uniprot %in% CT1p530_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p530"
+	}else if(uniprot %in% CT1p531_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p531"
+	}else if(uniprot %in% CT1p532_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p532"
+	}else if(uniprot %in% CT1p533_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT1p533"
+	}else if(uniprot %in% CT2p531_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p531"
+	}else if(uniprot %in% CT3p531_DOWN_p53$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p531"
+	}else if(uniprot %in% CT2p532_DOWN_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p532"
+	}else if(uniprot %in% CT2p533_DOWN_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT2p533"
+	}else if(uniprot %in% CT3p532_DOWN_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p532"
+	}else if(uniprot %in% CT3p533_DOWN_p53_pval$ID){
+		UPDOWN_p53$Subset[UPDOWN_p53$ID == uniprot] <- "CT3p533"
+	}
+}
+UPDOWN_p53 <- UPDOWN_p53 %>%
+	relocate(Subset, .after = ID)
+UPDOWN_p53$ID <- gsub("^CON_", "", UPDOWN_p53$ID)
+```
+
+##### Calculate what percentage corresponds to 2vs0
+```{r}
+(sum(UPDOWN_p53$Subset == "CT0p532" | UPDOWN_p53$Subset == "CT2p530")/nrow(UPDOWN_p53))*100
+```
+
+It corresponds to a 12% of the proteins, which is somehow acceptable.
+
+## More subsetting with p53
+
+#### Creating the gene lists for GO analysis
+```{r}
+write.table(UPDOWN_p53$ID, file=here("results", "proteomics", "prot_lists", "UPDOWN_p53_pval005_lfc0.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+write.table(gsub("^CON_", "", all_data_df$Accession), file=here("results", "proteomics", "prot_lists", "Reference_prot_list.txt"),  sep = "\n", quote = F, row.names = F, col.names = F)
+## This list is used as input in the UNIPROTKB tool of ID mapping with the gene name: https://www.uniprot.org/id-mapping
+## Once the file is created, we create a new file with both UNIPROT and Gene names
+# UPDOWN_p53_UNIPROT_GENENAME <- read.delim(here("results", "proteomics","prot_lists","UPDOWN_imp_pval005_lfc0_UNIPROT_GENENAME.txt"), sep = c("\t"), header = TRUE)
+```
+
+#### Subsetting with FC
+```{r}
+## From what I have seen in the literature, the common thresholds used in a proteomics analysis in cancer are FC > 1.2 and FC > 1.5
+UPDOWN_p53_FC1.2 <- UPDOWN_p53[abs(UPDOWN_p53$log2FC) > 0.26303440583379378, ] ## That number is the log2(1.2)
+UPDOWN_p53_FC1.3 <- UPDOWN_p53[abs(UPDOWN_p53$log2FC) > 0.37851162325372983, ] ## That number is the log2(1.3)
+UPDOWN_p53_FC1.5 <- UPDOWN_p53[abs(UPDOWN_p53$log2FC) > 0.58496250072115619, ] ## That number is the log2(1.5)
+```
+
+#### Subsetting with low confident subsets
+```{r}
+## As we mentioned previously, those subsets that contain only 1 replicate on one condition or one replicate in each are of low confidence, so we will discard them
+## This code should be used in case we use the absolute permissive dataset considering all subsets
+# UPDOWN_p53_FC1.2_No1rep <- UPDOWN_p53_FC1.2 %>%
+# 	dplyr::filter(!grepl("CT1p531|CT0p531|CT1p530", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+# UPDOWN_p53_FC1.5_No1rep <- UPDOWN_p53_FC1.5 %>%
+# 	dplyr::filter(!grepl("CT1p531|CT0p531|CT1p530", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+## With this subset we should calculate the mock logFC replacing the NAs with the minimum value of expression
+log2(min(na.omit(all_data_df[,c("Control_01_PA", "Control_02_PA", "Control_03_PA", "shp53_07_PA", "shp53_08_PA", "shp53_09_PA")])))
+## Taking into account the minimum value of the 6 columns in terms of LPA, we will use this value in substitution of the NAs from the LPA columns
+## We will calculate a mock log2FC for all the proteins 
+UPDOWN_p53_FC1.2_mockFC <- UPDOWN_p53_FC1.2 %>%
+	dplyr::mutate(CT1 = replace_na(CT1, 17.201688324717672)) %>%
+	dplyr::mutate(CT2 = replace_na(CT2, 17.201688324717672)) %>%
+	dplyr::mutate(CT3 = replace_na(CT3, 17.201688324717672)) %>%
+	dplyr::mutate(p531 = replace_na(p531, 17.201688324717672)) %>%
+	dplyr::mutate(p532 = replace_na(p532, 17.201688324717672)) %>%
+	dplyr::mutate(p533 = replace_na(p533, 17.201688324717672)) %>%
+	rowwise() %>% 
+	mutate(p53_mock_mean = mean(c(p531, p532, p533))) %>%
+	mutate(CT_mock_mean = mean(c(CT1, CT2, CT3))) %>%
+	transform(mock_logFC = p53_mock_mean - CT_mock_mean) %>%
+	relocate(mock_logFC, .after = log2FC)
+write.table(UPDOWN_p53_FC1.2_mockFC$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_p53_lfc1.2_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_p53_FC1.3_mockFC <- UPDOWN_p53_FC1.3 %>%
+	dplyr::mutate(CT1 = replace_na(CT1, 17.201688324717672)) %>%
+	dplyr::mutate(CT2 = replace_na(CT2, 17.201688324717672)) %>%
+	dplyr::mutate(CT3 = replace_na(CT3, 17.201688324717672)) %>%
+	dplyr::mutate(p531 = replace_na(p531, 17.201688324717672)) %>%
+	dplyr::mutate(p532 = replace_na(p532, 17.201688324717672)) %>%
+	dplyr::mutate(p533 = replace_na(p533, 17.201688324717672)) %>%
+	rowwise() %>% 
+	mutate(p53_mock_mean = mean(c(p531, p532, p533))) %>%
+	mutate(CT_mock_mean = mean(c(CT1, CT2, CT3))) %>%
+	transform(mock_logFC = p53_mock_mean - CT_mock_mean) %>%
+	relocate(mock_logFC, .after = log2FC)
+write.table(UPDOWN_p53_FC1.3_mockFC$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_p53_lfc1.3_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_p53_FC1.5_mockFC <- UPDOWN_p53_FC1.5 %>%
+	dplyr::mutate(CT1 = replace_na(CT1, 17.201688324717672)) %>%
+	dplyr::mutate(CT2 = replace_na(CT2, 17.201688324717672)) %>%
+	dplyr::mutate(CT3 = replace_na(CT3, 17.201688324717672)) %>%
+	dplyr::mutate(p531 = replace_na(p531, 17.201688324717672)) %>%
+	dplyr::mutate(p532 = replace_na(p532, 17.201688324717672)) %>%
+	dplyr::mutate(p533 = replace_na(p533, 17.201688324717672)) %>%
+	rowwise() %>% 
+	mutate(p53_mock_mean = mean(c(p531, p532, p533))) %>%
+	mutate(CT_mock_mean = mean(c(CT1, CT2, CT3))) %>%
+	transform(mock_logFC = p53_mock_mean - CT_mock_mean) %>%
+	relocate(mock_logFC, .after = log2FC)
+write.table(UPDOWN_p53_FC1.5_mockFC$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_p53_lfc1.5_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+## Now we have the mock FC for a mock ranking of the proteins, let's subset in terms of confidence. We will consider all genes in these datsets as "significant" or "somehow reliable" since they appear in, at least, 3 replicates from the 6.
+## We will keep the subset only with those with at least 4 replicates from the 6
+# UPDOWN_p53_FC1.2_No1rep_mockFC_no2vs1 <- UPDOWN_p53_FC1.2_No1rep_mockFC %>%
+# 	dplyr::filter(!grepl("CT2p531|CT1p532", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+# write.table(UPDOWN_p53_FC1.2_No1rep_mockFC_no2vs1$ID, file=here("output", "prot_lists", "UPDOWN_p53_FC1.2_No1rep_mockFC_no2vs1.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+# write.table(UPDOWN_p53_FC1.2_No1rep_mockFC_no2vs1$ID[order(abs(UPDOWN_p53_FC1.2_No1rep_mockFC_no2vs1$mock_logFC), decreasing = TRUE)], file=here("output", "prot_lists", "mockranked_UPDOWN_p53_FC1.2_No1rep_mockFC_no2vs1.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+# UPDOWN_p53_FC1.5_No1rep_mockFC_no2vs1 <- UPDOWN_p53_FC1.5_No1rep_mockFC %>%
+# 	dplyr::filter(!grepl("CT2p531|CT1p532", Subset)) %>%
+# 	dplyr::filter(!is.na(ID))
+# write.table(UPDOWN_p53_FC1.5_No1rep_mockFC_no2vs1$ID, file=here("output", "prot_lists", "UPDOWN_p53_FC1.5_No1rep_mockFC_no2vs1.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+```
+
+There is a paper: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9218934/. which spotlights this fact of having a presence of at least 50% of the samples and a at least one unique peptide.
+
+#### No NAs in pvalue filtering
+```{r}
+## In order to be super strict with the filtering, I will remove all those datasets with no significance parameter, which are those that have only one replicate in one of the two conditions. In this way, we are removing too much information I think. However, we will see the results we obtain from that
+UPDOWN_p53_FC1.2_sig <- UPDOWN_p53_FC1.2_mockFC %>%
+	dplyr::filter(!is.na(pvalue))
+write.table(UPDOWN_p53_FC1.2_sig$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_p53_pval005_lfc1.2_sig.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_p53_FC1.3_sig <- UPDOWN_p53_FC1.3_mockFC %>%
+	dplyr::filter(!is.na(pvalue))
+write.table(UPDOWN_p53_FC1.3_sig$ID, file=here("results", "proteomics","prot_lists", "UPDOWN_p53_pval005_lfc1.3_sig.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+UPDOWN_p53_FC1.5_sig <- UPDOWN_p53_FC1.5_mockFC %>%
+	dplyr::filter(!is.na(pvalue))
+write.table(UPDOWN_p53_FC1.5_sig$ID, file=here("results", "proteomics", "prot_lists", "UPDOWN_p53_pval005_lfc1.5_sig.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+```
+
+#### GO analysis
+
+After applying the FDR < 0.05 filter, no significant results were found. For that reason, we will consider a pvalue < 0.05
+```{r}
+options(digits = 4)
+```
+
+We start analyzing the GO enriched terms from the most strict dataset from RNF
+```{r}
+reference_proteome <- read.delim(here("reference_data", "proteomics", "mmusculus_proteome_UNIPROT.txt"), header = FALSE)
+ego.RNF_FC1.5_mockFC <- enrichGO(
+  UPDOWN_RNF_FC1.5_mockFC$ID,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.RNF_FC1.5_mockFC, showCategory = 25)
+```
+
+```{r dotplot, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.RNF_FC1.5_sig, showCategory = 25)
+```
+
+Then, the less restrictive
+```{r}
+ego.RNF_FC1.2_mockFC <- enrichGO(
+  UPDOWN_RNF_FC1.2_mockFC$ID,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.RNF_FC1.2_mockFC, showCategory = 20)
+```
+
+```{r}
+ego.RNF_FC1.2_sig <- enrichGO(
+  UPDOWN_RNF_FC1.2_sig$ID,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.RNF_FC1.2_sig, showCategory = 25)
+```
+
+##### p53
+
+```{r}
+ego.p53_FC1.5_sig <- enrichGO(
+  UPDOWN_p53_FC1.5_sig$ID,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.p53_FC1.5_sig, showCategory = 15)
+```
+
+```{r}
+ego.p53_FC1.2_sig <- enrichGO(
+  UPDOWN_p53_FC1.2_sig$ID,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.p53_FC1.2_sig, showCategory = 25)
+```
+
+```{r}
+ego.p53_FC1.2_mockFC <- enrichGO(
+  UPDOWN_p53_FC1.2_mockFC$ID,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.p53_FC1.2_mockFC, showCategory = 10)
+```
+
+#### Pathway analysis
+
+##### RNF
+
+```{r}
+UPDOWN_RNF_FC1.5_sig_UNIPROT_ENTREZ <- read.delim(here("results", "proteomics", "prot_lists", "UPDOWN_RNF_pval005_fc1.5_sig_UNIPROT_ENTREZ.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+kk <- enrichKEGG(gene = UPDOWN_RNF_FC1.5_sig_UNIPROT_ENTREZ$To, organism = "mmu")
+head(kk, n=10)
+```
+
+```{r}
+UPDOWN_RNF_FC1.2_mockFC_UNIPROT_ENTREZ <- read.delim(here("results", "proteomics", "prot_lists","UPDOWN_RNF_pval005_fc1.2_mockFC_UNIPROT_ENTREZ.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+kk <- enrichKEGG(gene = UPDOWN_RNF_FC1.2_mockFC_UNIPROT_ENTREZ$To, organism = "mmu")
+head(kk, n=20)
+```
+
+##### p53
+
+```{r}
+UPDOWN_p53_FC1.5_sig_UNIPROT_ENTREZ <- read.delim(here("results", "proteomics", "prot_lists", "UPDOWN_p53_pval005_fc1.5_sig_UNIPROT_ENTREZ.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+kk_p53_FC1.5_sig <- enrichKEGG(gene = UPDOWN_p53_FC1.5_sig_UNIPROT_ENTREZ$To, organism = "mmu")
+head(kk_p53_FC1.5_sig, n=10)
+```
+
+```{r}
+UPDOWN_p53_FC1.2_mockFC_UNIPROT_ENTREZ <- read.delim(here("results", "proteomics", "prot_lists", "UPDOWN_p53_pval005_fc1.2_mockFC_UNIPROT_ENTREZ.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+kk_p53_FC1.2_mockFC <- enrichKEGG(gene = UPDOWN_p53_FC1.2_mockFC_UNIPROT_ENTREZ$To, organism = "mmu")
+head(kk_p53_FC1.2_mockFC, n=10)
+```
+
+### GO genes analysis
+
+I have performed an overrepresentation analysis with the Gene Ontology website. I used 5 datasets to conduct the analysis. The one containing all proteins with a pvalue <0.05 and then two subsets depending on FC > 1.2 & FC > 1.5 and within those, one containing only 3vs1 and other confident proteins and finally one containing only those with a significance value.
+
+Now, I want to see coincidences in the proteins involved in the three selected GO terms which are: Cell cycle (as a whole), Microtubule cytoskeleton organization and Chromatin Organization. To do so, I will build a VennDiagram to see those coincidences. We will start with the less restrictive dataset, which is the one with no 2vs1 and FC > 1.2
+```{r}
+# Loading the data
+GO_CO_UPDOWN_RNF_FC1.2_mockFC <- read.delim(file = here("results", "proteomics", "GO_terms", "CO", "UPDOWN_RNF_FC1.2_mockFC_CO.txt"), header = FALSE, sep = "\t")
+GO_CO_UPDOWN_RNF_FC1.2_mockFC_UNIPROT <- GO_CO_UPDOWN_RNF_FC1.2_mockFC$V2
+write.table(GO_CO_UPDOWN_RNF_FC1.2_mockFC_UNIPROT, file=here("results", "proteomics","prot_lists", "GO_CO_UPDOWN_RNF_fc1.2_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+GO_CC_UPDOWN_RNF_FC1.2_mockFC <- read.delim(file = here("results", "proteomics", "GO_terms", "CC", "UPDOWN_RNF_FC1.2_mockFC_CC.txt"), header = FALSE, sep = "\t")
+GO_CC_UPDOWN_RNF_FC1.2_mockFC_UNIPROT <- GO_CC_UPDOWN_RNF_FC1.2_mockFC$V2
+write.table(GO_CC_UPDOWN_RNF_FC1.2_mockFC_UNIPROT, file=here("results", "proteomics","prot_lists", "GO_CC_UPDOWN_RNF_fc1.2_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+GO_MT_UPDOWN_RNF_FC1.2_mockFC <- read.delim(file = here("results", "proteomics", "GO_terms", "MT", "UPDOWN_RNF_FC1.2_mockFC_MT.txt"), header = FALSE, sep = "\t")
+GO_MT_UPDOWN_RNF_FC1.2_mockFC_UNIPROT <- GO_MT_UPDOWN_RNF_FC1.2_mockFC$V2
+write.table(GO_MT_UPDOWN_RNF_FC1.2_mockFC_UNIPROT, file=here("results", "proteomics","prot_lists", "GO_MT_UPDOWN_RNF_fc1.2_mockFC.txt"), sep = "\n", quote = F, row.names = F, col.names = F)
+
+# Chart
+venn.diagram(
+  x = list(GO_CO_UPDOWN_RNF_FC1.2_mockFC_UNIPROT, GO_CC_UPDOWN_RNF_FC1.2_mockFC_UNIPROT, GO_MT_UPDOWN_RNF_FC1.2_mockFC_UNIPROT),
+  category.names = c("Chromatin O." , "Cell Cycle " , "Microtubule Cytoskeleton Organization"),
+  filename = here("results", "proteomics", "plots", "GO_terms_comparison.png"),
+  output=TRUE
+)
+intersect(intersect(GO_CO_UPDOWN_RNF_FC1.2_mockFC_UNIPROT, GO_CC_UPDOWN_RNF_FC1.2_mockFC_UNIPROT), GO_MT_UPDOWN_RNF_FC1.2_mockFC_UNIPROT)
+```
+
+
+### Analysis comparing logFC
+
+#### Building the datasets
+
+```{r}
+## We need to obtain the ENSEMBL identifiers for the proteins
+UPDOWN_RNF_UNIPROT_ENSEMBL <- read.delim(here("output", "prot_lists","UPDOWN_pval005_lfc0_UNIPROT_ENSEMBL.txt"), sep = c("\t"), header = TRUE)
+UPDOWN_RNF_hits <- UPDOWN_RNF[UPDOWN_RNF$ID %in% UPDOWN_RNF_UNIPROT_ENSEMBL$From,]
+UPDOWN_RNF_UNIPROT_ENSEMBL_nodup <- UPDOWN_RNF_UNIPROT_ENSEMBL[!duplicated(UPDOWN_RNF_UNIPROT_ENSEMBL$From),] 
+UPDOWN_RNF_hits$ENSEMBL <- UPDOWN_RNF_UNIPROT_ENSEMBL_nodup$To[UPDOWN_RNF_UNIPROT_ENSEMBL_nodup$From %in% UPDOWN_RNF_hits$ID]
+UPDOWN_RNF_hits <- UPDOWN_RNF_hits %>%
+	relocate(ENSEMBL, .after = ID)
+```
+
+```{r}
+TRANS_DEGs_RNF <- read.csv(here("output", "datasets", "TopTable_DEGs_RNF_permissive.csv"))
+```
+
+```{r}
+both_permissive_hits <- intersect(TRANS_DEGs_RNF$Ensembl_ID, UPDOWN_RNF_hits$ENSEMBL)
+```
+
+```{r}
+## Check whether the genes are found in more restrictive datasets
+UNIPROT_both_hits <- UPDOWN_RNF_UNIPROT_ENSEMBL$From[UPDOWN_RNF_UNIPROT_ENSEMBL$To %in% both_permissive_hits]
+UNIPROT_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 <- UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1$ID[UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1$ID %in% UNIPROT_both_hits]
+ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 <- UPDOWN_RNF_UNIPROT_ENSEMBL$To[UPDOWN_RNF_UNIPROT_ENSEMBL$From %in% UNIPROT_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1]
+UNIPROT_hits_UPDOWN_RNF_FC1.2_sig <- UPDOWN_RNF_FC1.2_sig$ID[UPDOWN_RNF_FC1.2_sig$ID %in% UNIPROT_both_hits]
+ENSEMBL_hits_UPDOWN_RNF_FC1.2_sig <- UPDOWN_RNF_UNIPROT_ENSEMBL$From[UPDOWN_RNF_UNIPROT_ENSEMBL$To %in% UNIPROT_hits_UPDOWN_RNF_FC1.2_sig]
+```
+
+##### Both permissive
+```{r}
+## With the 3vs1 FC > 1.2
+TRANS_PROT_RNF <- as.data.frame(ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1)
+TRANS_DEGs_RNF_logFC_ordered <- TRANS_DEGs_RNF[order(match(TRANS_DEGs_RNF$Ensembl_ID, ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1)),]
+TRANS_PROT_RNF$logFC_TRANS <- TRANS_DEGs_RNF_logFC_ordered$log2FoldChange[TRANS_DEGs_RNF_logFC_ordered$Ensembl_ID %in% TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1]
+PROT_DEPs_RNF_logFC_ordered <- UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1[order(match(UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1$ID, UNIPROT_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1)),]
+TRANS_PROT_RNF$logFC_PROT <- PROT_DEPs_RNF_logFC_ordered$mock_logFC[PROT_DEPs_RNF_logFC_ordered$ID %in% UNIPROT_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1]
+TRANS_PROT_RNF$quadrant <- NA
+TRANS_PROT_RNF$quadrant <- factor(TRANS_PROT_RNF$quadrant, levels = 1:9)
+```
+
+##### Determine the quadrants
+```{r}
+for(protein in TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1){
+	if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT < -0.3785){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 1
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT < 0.3785){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 2
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT > 0.3785){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 3
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT < -0.3785){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 4
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT < 0.3785){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 5
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT > 0.3785 ){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 6
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS < -0.25 &  TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT < -0.3785 ){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 7
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS < -0.25 &  TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT < 0.3785 ){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 8
+	}else if(TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_TRANS < -0.25 & TRANS_PROT_RNF[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein, ]$logFC_PROT > 0.3785){
+		TRANS_PROT_RNF$quadrant[TRANS_PROT_RNF$ENSEMBL_hits_UPDOWN_RNF_FC1.2_No1rep_mockFC_no2vs1 == protein] <- 9
+	}
+}
+```
+
+```{r}
+cor.test(TRANS_PROT_RNF$logFC_TRANS, TRANS_PROT_RNF$logFC_PROT)
+```
+
+```{r}
+ggplot(TRANS_PROT_RNF, aes(x=logFC_PROT, y=logFC_TRANS, color = quadrant)) +
+	geom_vline(xintercept = c(-0.3785, 0.3785), linetype = "dashed") +
+	geom_hline(yintercept = c(-0.25, 0.25), linetype = "dashed") +
+	geom_point() +
+	ylim(-0.5, 0.5) +
+	theme_minimal()
+```
+
+#### List of genes from both TRANSCRIPTOMICS AND PROTEOMICS
+```{r}
+
+```
+
+#### Integrative analysis
+
+#### RNF
+Since we obtained a big loss of proteins in terms of mapping, we should conduct this approach in another way. We should first map the whole proteome obtained with the transcriptome. Then, plot those genes which are significant in terms of proteomics or transcriptomics. 
+
+```{r}
+Ref_proteins_UNIPROT_ENSEMBL <- read.delim(here("results", "proteomics", "prot_lists", "Reference_prot_list_UNIPROT_ENSEMBL.txt"), sep = c("\t"), header = TRUE)
+length(intersect(Ref_proteins_UNIPROT_ENSEMBL$From, UPDOWN_RNF_FC1.2_mockFC$ID))
+length(intersect(Ref_proteins_UNIPROT_ENSEMBL$To, sigResults.RNF$Ensembl_ID))
+```
+
+```{r}
+PROT_integrative_RNF <- UPDOWN_RNF_FC1.2_mockFC[UPDOWN_RNF_FC1.2_mockFC$ID %in% Ref_proteins_UNIPROT_ENSEMBL$From,]
+PROT_integrative_RNF_merge <- merge(PROT_integrative_RNF, Ref_proteins_UNIPROT_ENSEMBL, by.x = "ID", by.y = "From", all.x = TRUE)
+PROT_integrative_RNF <- PROT_integrative_RNF_merge %>%
+	relocate(To, .after = ID)
+## I have checked and the duplicates that are detected as duplicates are the genes we are not interested in
+PROT_integrative_RNF <- PROT_integrative_RNF[!duplicated(PROT_integrative_RNF$ID),]
+```
+
+```{r}
+# Dataset with the significant proteins mapped to all the transcripts
+## Now, the df of transcripts with only ENSEMBL_ID and log2FC
+TRANS_ENSEMBL_ID_lfc_RNF <- tt.DESeq.sva.RNF_tb[,c("Ensembl_ID", "log2FoldChange")]
+TRANS_PROT_RNF_sigP <- merge(PROT_integrative_RNF, TRANS_ENSEMBL_ID_lfc_RNF, by.x = "To", by.y = "Ensembl_ID", all.x = TRUE)
+TRANS_PROT_RNF_sigP <- TRANS_PROT_RNF_sigP[!is.na(TRANS_PROT_RNF_sigP$log2FoldChange),]
+TRANS_PROT_RNF_sigP_plotting_subset <- TRANS_PROT_RNF_sigP[,c("To", "ID", "log2FoldChange", "mock_logFC")]
+colnames(TRANS_PROT_RNF_sigP_plotting_subset) <- c("ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+TRANS_integrative_RNF <- sigResults.RNF[sigResults.RNF$Ensembl_ID %in% Ref_proteins_UNIPROT_ENSEMBL$To,]
+TRANS_integrative_RNF_merge <- merge(TRANS_integrative_RNF, Ref_proteins_UNIPROT_ENSEMBL, by.x = "Ensembl_ID", by.y = "To", all.x = TRUE)
+TRANS_integrative_RNF <- TRANS_integrative_RNF_merge %>%
+	relocate(From, .after = Ensembl_ID)
+```
+
+```{r}
+PROT_ENSEMBL_ID_lfc_RNF_trial <- all_data_df[,c("Accession", "LOG2FC_shRNF144BvsControl")]
+TRANS_PROT_RNF_sigT_trial <- merge(TRANS_integrative_RNF, PROT_ENSEMBL_ID_lfc_RNF_trial, by.x = "From", by.y = "Accession", all.x = TRUE)
+TRANS_PROT_RNF_sigT_trial <- TRANS_PROT_RNF_sigT_trial[TRANS_PROT_RNF_sigT_trial$LOG2FC_shRNF144BvsControl != "NA" & TRANS_PROT_RNF_sigT_trial$LOG2FC_shRNF144BvsControl != "INF",]
+TRANS_PROT_RNF_sigT_trial$LOG2FC_shRNF144BvsControl <- as.numeric(TRANS_PROT_RNF_sigT_trial$LOG2FC_shRNF144BvsControl)
+TRANS_PROT_RNF_sigT_plotting_subset_trial <- TRANS_PROT_RNF_sigT_trial[,c("Ensembl_ID", "From", "log2FoldChange", "LOG2FC_shRNF144BvsControl")]
+colnames(TRANS_PROT_RNF_sigT_plotting_subset_trial) <- c("ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+# Dataset with the significant genes mapped to all the proteins
+## Now, the df of proteins with only UNIPROT and mockFC
+PROT_ENSEMBL_ID_lfc_RNF <- UPDOWN_RNF_FC1.2_mockFC[,c("ID", "Subset", "mock_logFC")]
+TRANS_PROT_RNF_sigT <- merge(TRANS_integrative_RNF, PROT_ENSEMBL_ID_lfc_RNF, by.x = "From", by.y = "ID", all.x = TRUE)
+TRANS_PROT_RNF_sigT <- TRANS_PROT_RNF_sigT[!is.na(TRANS_PROT_RNF_sigT$mock_logFC),]
+TRANS_PROT_RNF_sigT_plotting_subset <- TRANS_PROT_RNF_sigT[,c("Subset", "Ensembl_ID", "From", "log2FoldChange", "mock_logFC")]
+colnames(TRANS_PROT_RNF_sigT_plotting_subset) <- c("Subset", "ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+# Dataset for the plotting
+TRANS_PROT_RNF_plot_dataset <- rbind(TRANS_PROT_RNF_sigP_plotting_subset, TRANS_PROT_RNF_sigT_plotting_subset_trial)
+TRANS_PROT_RNF_plot_dataset <- TRANS_PROT_RNF_plot_dataset[!duplicated(TRANS_PROT_RNF_plot_dataset$UNIPROT),]
+TRANS_PROT_RNF_plot_dataset$quadrant <- NA
+TRANS_PROT_RNF_plot_dataset$quadrant <- factor(TRANS_PROT_RNF_plot_dataset$quadrant, levels = 1:9)
+```
+
+```{r}
+for(protein in TRANS_PROT_RNF_plot_dataset$UNIPROT){
+	if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.3785){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 1
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.3785){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 2
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.3785){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 3
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.3785){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 4
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.3785){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 5
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.3785 ){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 6
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -0.25 &  TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.3785 ){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 7
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -0.25 &  TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.3785 ){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 8
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -0.25 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.3785){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 9
+	}
+}
+```
+
+```{r}
+cor.test(TRANS_PROT_RNF_plot_dataset$logFC_TRANS, TRANS_PROT_RNF_plot_dataset$logFC_PROT)
+```
+
+```{r}
+ggplot(TRANS_PROT_RNF_plot_dataset, aes(x=logFC_PROT, y=logFC_TRANS, color = quadrant)) +
+	geom_vline(xintercept = c(-0.3785, 0.3785), linetype = "dashed") +
+	geom_hline(yintercept = c(-0.25, 0.25), linetype = "dashed") +
+	geom_point() +
+	theme_minimal()
+```
+
+#### List of genes from both TRANSCRIPTOMICS AND PROTEOMICS interesting
+```{r}
+interesting_genes_TRANS_PROT_RNF <- TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$quadrant == 3 | TRANS_PROT_RNF_plot_dataset$quadrant == 6,]
+interesting_genes_TRANS_PROT_RNF <- interesting_genes_TRANS_PROT_RNF[order(interesting_genes_TRANS_PROT_RNF$logFC_PROT, decreasing = TRUE),]
+write.table(interesting_genes_TRANS_PROT_RNF$UNIPROT, file = here("results","proteomics","prot_lists", "Interesting_genes_PROT_TRANS_RNF_UNIPROT.txt"), row.names = FALSE, col.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+##### GO analysis with these genes
+
+```{r}
+ego.interesting_genes_TRANS_PROT_RNF <- enrichGO(
+  interesting_genes_TRANS_PROT_RNF$UNIPROT,
+  "UNIPROT",
+  universe = reference_proteome$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=5, fig.height=5, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.interesting_genes_TRANS_PROT_RNF, showCategory = 25)
+```
+
+##### Pathway analysis with interesting genes
+
+```{r}
+interesting_genes_TRANS_PROT_RNF_UNIPROT_ENTREZ <- read.delim(here("results", "proteomics", "prot_lists","Interesting_genes_PROT_TRANS_RNF_UNIPROT_ENTREZ.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+kk_interesting_genes_TRANS_PROT_RNF <- enrichKEGG(gene = interesting_genes_TRANS_PROT_RNF_UNIPROT_ENTREZ$To, organism = "mmu")
+head(kk, n=10)
+```
+
+#### p53
+Since we obtained a big loss of proteins in terms of mapping, we should conduct this approach in another way. We should first map the whole proteome obtained with the transcriptome. Then, plot those genes which are significant in terms of proteomics or transcriptomics. 
+
+```{r}
+Ref_proteins_UNIPROT_ENSEMBL <- read.delim(here("results", "proteomics", "prot_lists", "Reference_prot_list_UNIPROT_ENSEMBL.txt"), sep = c("\t"), header = TRUE)
+length(intersect(Ref_proteins_UNIPROT_ENSEMBL$From, UPDOWN_p53_FC1.2_mockFC$ID))
+length(intersect(Ref_proteins_UNIPROT_ENSEMBL$To, sigResults.p53$Ensembl_ID))
+```
+
+```{r}
+PROT_integrative_p53 <- UPDOWN_p53_FC1.2_mockFC[UPDOWN_p53_FC1.2_mockFC$ID %in% Ref_proteins_UNIPROT_ENSEMBL$From,]
+PROT_integrative_p53_merge <- merge(PROT_integrative_p53, Ref_proteins_UNIPROT_ENSEMBL, by.x = "ID", by.y = "From", all.x = TRUE)
+PROT_integrative_p53 <- PROT_integrative_p53_merge %>%
+	relocate(To, .after = ID)
+## I have checked and the duplicates that are detected as duplicates are the genes we are not interested in
+PROT_integrative_p53 <- PROT_integrative_p53[!duplicated(PROT_integrative_p53$ID),]
+```
+
+```{r}
+# Dataset with the significant proteins mapped to all the transcripts
+## Now, the df of transcripts with only ENSEMBL_ID and log2FC
+TRANS_ENSEMBL_ID_lfc_p53 <- tt.DESeq.sva.p53_tb[,c("Ensembl_ID", "log2FoldChange")]
+TRANS_PROT_p53_sigP <- merge(PROT_integrative_p53, TRANS_ENSEMBL_ID_lfc_p53, by.x = "To", by.y = "Ensembl_ID", all.x = TRUE)
+TRANS_PROT_p53_sigP <- TRANS_PROT_p53_sigP[!is.na(TRANS_PROT_p53_sigP$log2FoldChange),]
+TRANS_PROT_p53_sigP_plotting_subset <- TRANS_PROT_p53_sigP[,c("To", "ID", "log2FoldChange", "mock_logFC")]
+colnames(TRANS_PROT_p53_sigP_plotting_subset) <- c("ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+TRANS_integrative_p53 <- sigResults.p53[sigResults.p53$Ensembl_ID %in% Ref_proteins_UNIPROT_ENSEMBL$To,]
+TRANS_integrative_p53_merge <- merge(TRANS_integrative_p53, Ref_proteins_UNIPROT_ENSEMBL, by.x = "Ensembl_ID", by.y = "To", all.x = TRUE)
+TRANS_integrative_p53 <- TRANS_integrative_p53_merge %>%
+	relocate(From, .after = Ensembl_ID)
+```
+
+```{r}
+PROT_ENSEMBL_ID_lfc_p53_trial <- all_data_df[,c("Accession", "LOG2FC_shp53vsControl")]
+TRANS_PROT_p53_sigT_trial <- merge(TRANS_integrative_p53, PROT_ENSEMBL_ID_lfc_p53_trial, by.x = "From", by.y = "Accession", all.x = TRUE)
+TRANS_PROT_p53_sigT_trial <- TRANS_PROT_p53_sigT_trial[TRANS_PROT_p53_sigT_trial$LOG2FC_shp53vsControl != "NA" & TRANS_PROT_p53_sigT_trial$LOG2FC_shp53vsControl != "INF",]
+TRANS_PROT_p53_sigT_trial$LOG2FC_shp53vsControl <- as.numeric(TRANS_PROT_p53_sigT_trial$LOG2FC_shp53vsControl)
+TRANS_PROT_p53_sigT_plotting_subset_trial <- TRANS_PROT_p53_sigT_trial[,c("Ensembl_ID", "From", "log2FoldChange", "LOG2FC_shp53vsControl")]
+colnames(TRANS_PROT_p53_sigT_plotting_subset_trial) <- c("ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+# Dataset with the significant genes mapped to all the proteins
+## Now, the df of proteins with only UNIPROT and mockFC
+PROT_ENSEMBL_ID_lfc_p53 <- UPDOWN_p53_FC1.2_mockFC[,c("ID", "Subset", "mock_logFC")]
+TRANS_PROT_p53_sigT <- merge(TRANS_integrative_p53, PROT_ENSEMBL_ID_lfc_p53, by.x = "From", by.y = "ID", all.x = TRUE)
+TRANS_PROT_p53_sigT <- TRANS_PROT_p53_sigT[!is.na(TRANS_PROT_p53_sigT$mock_logFC),]
+TRANS_PROT_p53_sigT_plotting_subset <- TRANS_PROT_p53_sigT[,c("Subset", "Ensembl_ID", "From", "log2FoldChange", "mock_logFC")]
+colnames(TRANS_PROT_p53_sigT_plotting_subset) <- c("Subset", "ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+# Dataset for the plotting
+TRANS_PROT_p53_plot_dataset <- rbind(TRANS_PROT_p53_sigP_plotting_subset, TRANS_PROT_p53_sigT_plotting_subset_trial)
+TRANS_PROT_p53_plot_dataset <- TRANS_PROT_p53_plot_dataset[!duplicated(TRANS_PROT_p53_plot_dataset$UNIPROT),]
+TRANS_PROT_p53_plot_dataset$quadrant <- NA
+TRANS_PROT_p53_plot_dataset$quadrant <- factor(TRANS_PROT_p53_plot_dataset$quadrant, levels = 1:9)
+```
+
+```{r}
+for(protein in TRANS_PROT_p53_plot_dataset$UNIPROT){
+	if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.3785){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 1
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.3785){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 2
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.3785){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 3
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.3785){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 4
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.3785){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 5
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.3785 ){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 6
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -0.25 &  TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.3785 ){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 7
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -0.25 &  TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.3785 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.3785 ){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 8
+	}else if(TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -0.25 & TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.3785){
+		TRANS_PROT_p53_plot_dataset$quadrant[TRANS_PROT_p53_plot_dataset$UNIPROT == protein] <- 9
+	}
+}
+```
+
+```{r}
+cor.test(TRANS_PROT_p53_plot_dataset$logFC_TRANS, TRANS_PROT_p53_plot_dataset$logFC_PROT)
+```
+
+```{r}
+ggplot(TRANS_PROT_p53_plot_dataset, aes(x=logFC_PROT, y=logFC_TRANS, color = quadrant)) +
+	geom_vline(xintercept = c(-0.3785, 0.3785), linetype = "dashed") +
+	geom_hline(yintercept = c(-0.25, 0.25), linetype = "dashed") +
+	geom_point() +
+	theme_minimal()
+```
+
+#### List of genes from both TRANSCRIPTOMICS AND PROTEOMICS interesting
+```{r}
+interesting_genes_TRANS_PROT_p53 <- TRANS_PROT_p53_plot_dataset[TRANS_PROT_p53_plot_dataset$quadrant == 3 | TRANS_PROT_p53_plot_dataset$quadrant == 6,]
+interesting_genes_TRANS_PROT_p53 <- interesting_genes_TRANS_PROT_p53[order(interesting_genes_TRANS_PROT_p53$logFC_PROT, decreasing = TRUE),]
+write.table(interesting_genes_TRANS_PROT_p53$UNIPROT, file = here("results","proteomics","prot_lists", "Interesting_genes_PROT_TRANS_p53_UNIPROT.txt"), row.names = FALSE, col.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+##### GO analysis with these genes
+
+```{r}
+ego.interesting_genes_TRANS_PROT_p53 <- enrichGO(
+	interesting_genes_TRANS_PROT_p53$UNIPROT,
+	"UNIPROT",
+	universe = reference_proteome$V1,
+	OrgDb = org.Mm.eg.db,
+	ont = "BP",
+	pAdjustMethod = "BH",
+	qvalueCutoff = 0.05,
+	readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+clusterProfiler::dotplot(ego.interesting_genes_TRANS_PROT_p53, showCategory = 25)
+```
+
+##### Pathway analysis with interesting genes
+
+```{r}
+interesting_genes_TRANS_PROT_p53_UNIPROT_ENTREZ <- read.delim(here("results", "proteomics", "prot_lists","Interesting_genes_PROT_TRANS_p53_UNIPROT_ENTREZ.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+kk_interesting_genes_TRANS_PROT_p53 <- enrichKEGG(gene = interesting_genes_TRANS_PROT_p53_UNIPROT_ENTREZ$To, organism = "mmu")
+head(kk, n=10)
+```
+
+
+#### Kaplan Meier Plot
+
+```{r}
+# Load the data
+## Data has been stratified by p53 status, here we will analyse TP53 WT samples
+survival_rnf144b_p53WT_df = read.delim(here("analysis","data","derived_data","xenabrowser","TCGA","RNF144b_expression_OS.time_p53WT.tsv"), sep = "\t")
+survival_rnf144b_p53WT_df = survival_rnf144b_p53WT_df %>%
+	mutate(expression = if_else(RNF144B >= median(survival_rnf144b_p53WT_df$RNF144B), "high", "low"))
+fit = survfit(Surv(OS.time, OS) ~ expression, data = survival_rnf144b_p53WT_df)
+```
+
+```{r, fig.height=7, fig.width=10}
+km_plot_rnf144b_expression_TP53 = ggsurvplot(
+	fit, 
+	data = survival_rnf144b_p53WT_df, 
+	censor.shape="+", 
+	censor.size = 4,
+	size = 1,
+	palette = c("#E7B800", "#2E9FDF"),
+	conf.int = TRUE,
+	pval = TRUE,
+	pval.method = TRUE,
+	risk.table = TRUE,
+	legend.labs = c("High", "Low"),
+	xlim = c(0,5500),
+	xlab = "Time in days",
+	break.time.by = 1000,
+	risk.table.y.text.col = T,
+  risk.table.y.text = FALSE,
+	surv.median.line = "hv",
+	legend.title = c("RNF144b expression"),
+	risk.table.y.title = c("RNF144b expression")
+	)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Kaplan_meier_RNF144b_expression_TP53WT.pdf"), width = 10, height = 7)
+km_plot_rnf144b_expression_TP53
+dev.off()
+```
+
+
+
+

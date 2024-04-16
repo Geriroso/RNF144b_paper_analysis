@@ -1,0 +1,795 @@
+---
+title: "Rnf144b_final_proteomics_analysis"
+author:
+- name: "Gerard Romero Sola"
+  affiliation: Cancer Biology Unit - Ana Janic's Lab
+  email: gerard.romero02@estudiant.upf.edu
+date: "`r Sys.Date()`"
+output:
+	  BiocStyle::html_document:
+	  keep_md: yes
+	  toc: true
+      toc_float:
+        collapsed: true
+        smooth_scroll: true
+      toc_depth: 3
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      fig_captions: yes
+      theme: lumen
+      self_contained: true
+   fig_width: 10
+   fig_height: 10
+bibliography: bibliography.bib
+---
+
+```{css, include=FALSE}
+body {
+  text-align: justify;
+}
+```
+
+## Loading the packages
+
+```{r load-libraries, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(vsn))
+suppressPackageStartupMessages(library(geneplotter))
+suppressPackageStartupMessages(library(missForest))
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(limma))
+suppressPackageStartupMessages(library(DEP))
+suppressPackageStartupMessages(library(httr))
+suppressPackageStartupMessages(library(UniProt.ws))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(org.Mm.eg.db))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(rrvgo))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(xlsx))
+suppressPackageStartupMessages(library(EnhancedVolcano))
+suppressPackageStartupMessages(library(GOstats))
+suppressPackageStartupMessages(library(ggh4x))
+suppressPackageStartupMessages(library(DOSE))
+suppressPackageStartupMessages(library(VennDiagram))
+suppressPackageStartupMessages(library(grDevices))
+suppressPackageStartupMessages(library(RColorBrewer))
+```
+
+## Data loading, processing & quality assessment
+
+This dataset has been previously processed with Proteome Discoverer [version]. At the moment, I will start with a quality assessment of the data and processing it by scratch starting from the protein abundances.
+
+```{r load-data}
+all_data_df = read_xlsx(here("analysis","data","raw_data","proteomics","2020MQ044-PROTEOMICS.xlsx"), sheet = 1, range = "A2:AP6495")
+# Keep only rows with accession identifier and protein abundances
+protein_abundances_df = all_data_df[,c(3,8,15:23)]
+protein_abundances_df = protein_abundances_df %>%
+	dplyr::rename(unique_peptides = "# Unique Peptides",CT1_PA = "Control_01...15",CT2_PA = "Control_02...16",
+				 CT3_PA = "Control_03...17",RNF1_PA = "shRNF144B_04...18",RNF2_PA = "shRNF144B_05...19",
+				 RNF3_PA = "shRNF144B_06...20",P531_PA = "shp53_07...21",P532_PA = "shp53_08...22",
+				 P533_PA = "shp53_09...23")
+options(digits = 4) # get all decimals
+reference_proteome <- read.delim(here("analysis","data","derived_data","proteomics","extdata","uniprot_ids","mmusculus_proteome_UNIPROT.txt"), header = FALSE)
+reference_proteome_reviewed <- read.delim(here("analysis","data","derived_data","proteomics","extdata","uniprot_ids","mmusculus_proteome_reviewed_UNIPROT.txt"), header = FALSE)
+```
+
+### Rnf144b
+
+```{r rnf144b-processing}
+df_Rnf144b_analysis = protein_abundances_df %>%
+	dplyr::select(Accession,unique_peptides,CT1_PA,CT2_PA,CT3_PA,RNF1_PA,RNF2_PA,RNF3_PA)
+```
+
+Explore the empirical cumulative distribution of the number of unique peptides throughout all the 6493 proteins.
+
+```{r unique-peptides-dist,dev='png'}
+plot.ecdf(df_Rnf144b_analysis$unique_peptides, panel.first=grid(),
+          xlab="N. unique peptides", las=1, main="Empirical cumulative distribution of unique peptides")
+```
+
+Explore the protein quantification values as function of the number of unique peptides.
+
+```{r number-unique-peptides}
+f <- cut(df_Rnf144b_analysis$unique_peptides, breaks=c(0, 1, 10, 20, 80))
+logQ <- rowMeans(log2(df_Rnf144b_analysis[3:8]))
+plot(logQ ~ f, xlab="# Uniq. Pept.", ylab="Mean log2 Quant.", xaxt="n", las=1)
+axis(1, at=1:nlevels(f), labels=sprintf("%s\n(n=%d)", levels(f), table(f)), padj=0.5)
+```
+## DEP package analysis
+
+Obtain Gene Symbols
+
+```{r}
+gene_names_from_uniprot = mapUniProt(from = "UniProtKB_AC-ID", to = "Gene_Name", query = protein_abundances_df$Accession)
+protein_abundances_df_merged = merge(gene_names_from_uniprot, protein_abundances_df, by.x = "From", by.y = "Accession", all.y = TRUE)
+data_unique = make_unique(protein_abundances_df_merged, "To", "From", delim = ";")
+```
+
+We will build a SummarizedExperiment object:
+
+```{r}
+protein_abundances_counts = data_unique %>%
+	dplyr::select(-c(From, To, unique_peptides)) %>%
+	relocate(name, .before = CT1_PA) %>%
+	relocate(ID, .before = name)
+colnames(protein_abundances_counts) = c("ID","name","Control1","Control2","Control3","Rnf144b1","Rnf144b2","Rnf144b3","p531","p532","p533")
+
+experimental_design = data.frame(label = c("Control1","Control2","Control3","Rnf144b1","Rnf144b2","Rnf144b3","p531","p532","p533"),
+																 condition = c(rep("Control",3), rep("Rnf144b",3), rep("p53",3)),
+																 replicate = c(rep(c(1:3),3)))
+```
+
+```{r}
+data_se <- make_se(protein_abundances_counts, 3:11, experimental_design)
+assay(data_se)
+```
+
+```{r}
+plot_frequency(data_se)
+```
+
+### Filtering
+
+```{r}
+data_filt = filter_missval(data_se, thr = 0)
+data_filt_unique = data_filt[rowData(data_filt)$ID %in% df_Rnf144b_analysis$Accession[df_Rnf144b_analysis$unique_peptides >= 2],]
+```
+
+```{r}
+plot_numbers(data_filt)
+```
+
+```{r}
+plot_coverage(data_filt)
+```
+
+
+```{r}
+#plot_detect(data_norm)
+```
+
+#### Mixed imputation
+
+I will apply different imputation methods depending if the value is an MNAR or MAR
+
+```{r}
+set.seed(999)
+# Extract protein names with missing values in all replicates of at least one condition
+proteins_MNAR_unique <- get_df_long(data_filt_unique) %>%
+  group_by(name, condition) %>%
+  summarize(NAs = all(is.na(intensity))) %>% 
+  filter(NAs) %>% 
+  pull(name) %>% 
+  unique()
+
+# Get a logical vector
+MNAR_unique <- names(data_filt_unique) %in% proteins_MNAR_unique
+
+# Perform mixed imputation
+mixed_imputation_MinProb_filt_unique <- impute(
+  data_filt_unique, 
+  fun = "mixed",
+  randna = !MNAR_unique, # we have to define MAR which is the opposite of MNAR
+  mar = "knn", # imputation function for MAR
+  mnar = "MinProb")
+```
+
+### Differential expression
+
+```{r}
+DE_analysis <- function(se) {
+  se %>% 
+    test_diff(., type = "control", control = "Control") %>%
+    add_rejections(., alpha = 0.05, lfc = log2(1.5)) %>%
+		get_results()
+}
+# Function to extract number of DE proteins
+DE_prots <- function(results) {
+  data_frame(Dataset = gsub("_results", "", results),
+    significant_proteins = get(results) %>% 
+      filter(significant) %>% 
+      nrow())
+}
+```
+
+```{r}
+# DE analysis on no, knn, MinProb and mixed imputation
+mixed_imputation_MinProb_filt_unique_results <- DE_analysis(mixed_imputation_MinProb_filt_unique)
+```
+
+```{r}
+hist(mixed_imputation_MinProb_filt_unique_results$Rnf144b_vs_Control_p.val, main="", xlab="Raw P-value", col="grey", las=1)
+```
+
+```{r}
+data_diff_MinProb_filt_unique = test_diff(mixed_imputation_MinProb_filt_unique, type = "control", control = "Control")
+dep_MinProb_imp_filt_unique = add_rejections(data_diff_MinProb_filt_unique, alpha = 0.05, lfc = log2(1.5))
+```
+
+```{r}
+PCA_MinProb = plot_pca(dep_MinProb_imp_filt_unique[,1:6], x = 1, y = 2, n = 500, point_size = 3) + ggtitle("PCA Mixed Imputation")
+```
+
+```{r}
+pdf(file = here("analysis","figures","Proteomics_PCA_filt_unique_FC1.5_pval0.05.pdf"), width = 10, height = 10)
+PCA_MinProb
+dev.off()
+```
+
+```{r}
+# Subset the significative and over-expressed proteins
+sig_expressed_proteins_RNF_ID = mixed_imputation_MinProb_filt_unique_results %>%
+	dplyr::filter(abs(Rnf144b_vs_Control_ratio) > 0.585 & Rnf144b_vs_Control_p.val < 0.05) %>%
+	pull(ID)
+sig_expressed_proteins_RNF_name = mixed_imputation_MinProb_filt_unique_results %>%
+	dplyr::filter(abs(Rnf144b_vs_Control_ratio) > 0.585 & Rnf144b_vs_Control_p.val < 0.05) %>%
+	pull(name)
+sig_over_expressed_proteins_RNF_ID = mixed_imputation_MinProb_filt_unique_results %>%
+	dplyr::filter(Rnf144b_vs_Control_ratio > 0.585 & Rnf144b_vs_Control_p.val < 0.05) %>%
+	pull(ID)
+sig_over_expressed_proteins_RNF_name = mixed_imputation_MinProb_filt_unique_results %>%
+	dplyr::filter(Rnf144b_vs_Control_ratio > 0.585 & Rnf144b_vs_Control_p.val < 0.05) %>%
+	pull(name)
+length(sig_expressed_proteins_RNF_ID)
+list_of_sig_overexpressed_proteins_RNF = mixed_imputation_MinProb_filt_unique_results %>%
+	dplyr::filter(Rnf144b_vs_Control_ratio > 0.585 & Rnf144b_vs_Control_p.val < 0.05) %>%
+	dplyr::select(ID, name)
+
+write.table(list_of_sig_overexpressed_proteins_RNF, file = here("analysis","figures", "sig_overexpressed_proteins_filt_unique_RNF_ID_UNIPROT.txt"), row.names = FALSE, col.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+```{r}
+# Create matrix with over-expressed significant proteins
+mat_over_expressed_proteins_RNF = assay(dep_MinProb_imp_filt_unique)
+#[rownames(assay(dep_MinProb_imp_filt_unique)) %in% sig_over_expressed_proteins_RNF_name,]
+scaled_mat_over_expressed_proteins_RNF = t(apply(mat_over_expressed_proteins_RNF, 1, scale))
+colnames(scaled_mat_over_expressed_proteins_RNF) = colnames(mat_over_expressed_proteins_RNF)
+```
+
+```{r}
+heatmap_over_expressed_proteins_RNF144b_scaled = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][rownames(scaled_mat_over_expressed_proteins_RNF) %in% list_of_sig_overexpressed_proteins_RNF$name,], name = "scaled log2 Protein Abundance", show_row_names = FALSE, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_over_expressed_proteins_RNF144b_scaled.pdf"), width = 10, height = 10)
+heatmap_over_expressed_proteins_RNF144b_scaled
+dev.off()
+heatmap_non_significant_proteins_RNF144b_scaled = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][!rownames(scaled_mat_over_expressed_proteins_RNF) %in% list_of_sig_overexpressed_proteins_RNF$name,], name = "scaled log2 Protein Abundance", show_row_names = FALSE, cluster_columns = FALSE, cluster_rows = FALSE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_non_significant_proteins_RNF144b_scaled.pdf"), width = 10, height = 10)
+heatmap_non_significant_proteins_RNF144b_scaled
+dev.off()
+```
+
+
+```{r}
+volcano_data.RNF = mixed_imputation_MinProb_filt_unique_results %>%
+	dplyr::select(name, ID, Rnf144b_vs_Control_ratio,Rnf144b_vs_Control_p.val) %>%
+	dplyr::rename(log2FC = Rnf144b_vs_Control_ratio, pval = Rnf144b_vs_Control_p.val)
+write.xlsx(volcano_data.RNF,file = here("analysis","figures", "TopTable_filt_unique_RNF144b.xlsx"), sheetName = "Sheet1")
+tt_DEGs = volcano_data.RNF %>%
+	filter(abs(log2FC) > 0.585 & pval < 0.05)
+write.xlsx(tt_DEGs,file = here("analysis","figures", "TopTable_DEPs_RNF144b.xlsx"), sheetName = "Sheet1")
+tt_noDEGs = volcano_data.RNF %>%
+	filter(!ID %in% tt_DEGs$ID)
+write.xlsx(tt_noDEGs,file = here("analysis","figures", "TopTable_NO_DEPs_RNF144b.xlsx"), sheetName = "Sheet1")
+```
+
+```{r, fig.width=10, fig.height=10}
+keyvals <- ifelse(
+    volcano_data.RNF$log2FC > 0.585 & volcano_data.RNF$pval < 0.05, 'red', ifelse(
+    	volcano_data.RNF$log2FC < -0.585 & volcano_data.RNF$pval < 0.05, 'blue',"grey"))
+names(keyvals)[keyvals == 'red'] <- 'over_expressed'
+names(keyvals)[keyvals == 'blue'] <- 'down_expressed'
+names(keyvals)[keyvals == 'grey'] <- 'ns'
+
+Volcano_RNF_over_expressed_prot_FC1.5_pval0.05 = EnhancedVolcano(volcano_data.RNF,
+		lab = volcano_data.RNF$name, 
+		selectLab = c("Tp53","Cdkn2b","Ccnb2","Tpx2","Rad21", "Map4","Kif4","Bccip","Cdk11b","Abraxas2","Map1b","Rif1","Map1b","Bard1"),
+		colAlpha = 0.9,
+    x = 'log2FC', y = 'pval', pCutoff = 0.05, FCcutoff=0.585, labSize = 8, 
+    colCustom = keyvals,
+    ylim = c(0,6),
+    legendPosition = "none",
+    title = "",
+		axisLabSize = 30,
+    subtitle = "",
+    boxedLabels = FALSE,
+    parseLabels = FALSE,
+    labFace = 'bold',
+    cutoffLineWidth = 1,
+		cutoffLineCol = "darkgrey",
+    drawConnectors = TRUE,
+    widthConnectors = 0.3,
+    cutoffLineType = "longdash",
+		maxoverlapsConnectors = Inf,
+    caption = "",
+    colConnectors = 'black', gridlines.major = FALSE, gridlines.minor = FALSE)
+Volcano_RNF_over_expressed_prot_FC1.5_pval0.05_selected_Etna = EnhancedVolcano(volcano_data.RNF,
+		lab = volcano_data.RNF$name, 
+		selectLab = c("Tp53","Cdkn2b","Ccnb2","Cdk2","Tpx2","Rad21", "Map4","Kif4","Bccip","Cdk11b","Abraxas2","Map1b","Rif1","Map1b","Bard1", "Akr1c6","Slc38a4","Sav1"),
+		colAlpha = 0.9,
+    x = 'log2FC', y = 'pval', pCutoff = 0.05, FCcutoff=0.585, labSize = 3, 
+    colCustom = keyvals,
+    ylim = c(0,6),
+    legendPosition = "none",
+    title = "",
+		axisLabSize = 30,
+    subtitle = "",
+    boxedLabels = FALSE,
+    parseLabels = FALSE,
+    labFace = 'bold',
+    cutoffLineWidth = 1,
+		cutoffLineCol = "darkgrey",
+    drawConnectors = TRUE,
+    widthConnectors = 0.3,
+    cutoffLineType = "longdash",
+		maxoverlapsConnectors = Inf,
+    caption = "",
+    colConnectors = 'black', gridlines.major = FALSE, gridlines.minor = FALSE)
+```
+
+```{r}
+png(file = here("analysis","figures","Proteomics_Volcano_RNF_over_expressed_prot_unique_FC1.5_pval0.05.png"), width = 900, height = 900, units = "px")
+Volcano_RNF_over_expressed_prot_FC1.5_pval0.05
+dev.off()
+pdf(file = here("analysis","figures","Proteomics_Volcano_RNF_over_expressed_prot_unique_FC1.5_pval0.05.pdf"))
+Volcano_RNF_over_expressed_prot_FC1.5_pval0.05
+dev.off()
+```
+
+```{r, fig.width=10, fig.height=10}
+pdf(file = here("analysis","figures","Proteomics_Volcano_RNF_over_expressed_prot_unique_FC1.5_pval0.05_etna_selected.pdf"), width = 12, height = 12)
+Volcano_RNF_over_expressed_prot_FC1.5_pval0.05_selected_Etna
+dev.off()
+```
+
+```{r}
+# Extract the important GO enriched terms from these subset of genes
+ego_over_expressed_RNF_list_filt_unique <- enrichGO(
+  sig_over_expressed_proteins_RNF_ID,
+  "UNIPROT",
+  universe = reference_proteome_reviewed$V1,
+  OrgDb = org.Mm.eg.db,
+  ont = c("BP"),
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.1,
+  readable = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+GO_terms_RNF_unique_overexpressed_pval0.05_FC1.5 = clusterProfiler::dotplot(ego_over_expressed_RNF_list_filt_unique, showCategory = 25)
+pdf(file = here("analysis","figures","Proteomics_GO_terms_RNF_unique_overexpressed_pval0.05_FC1.5.pdf"), width = 12, height = 14)
+GO_terms_RNF_unique_overexpressed_pval0.05_FC1.5
+dev.off()
+```
+
+```{r}
+# Extract genes from interesting terms
+## DNA Damage Repair response
+regulation_of_DNA_repair = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0006282"], split = "/"))
+regulation_of_double_strand_break_repair_via_homologous_recombination = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0010569"], split = "/"))
+regulation_of_response_to_DNA_damage_stimulus = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:2001020"], split = "/"))
+regulation_of_double_strand_break_repair = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:2000779"], split = "/"))
+positive_regulation_of_DNA_repair = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0045739"], split = "/"))
+double_strand_break_repair = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0006302"], split = "/"))
+positive_regulation_of_double_strand_break_repair = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:2000781"], split = "/"))
+DNA_damage_and_repair = union(c(regulation_of_DNA_repair,regulation_of_double_strand_break_repair_via_homologous_recombination,regulation_of_response_to_DNA_damage_stimulus, regulation_of_double_strand_break_repair, positive_regulation_of_DNA_repair, double_strand_break_repair),positive_regulation_of_double_strand_break_repair)
+
+## Cell cycle
+regulation_of_mitotic_cell_cycle_phase_transition = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:1901990"], split = "/"))
+chromosome_segregation = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0007059"], split = "/"))
+mitotic_cell_cycle_phase_transition = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0044772"], split = "/"))
+regulation_of_cell_cycle_G2_M_phase_transition = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:1902749"], split = "/"))
+Cell_cycle = union(c(regulation_of_mitotic_cell_cycle_phase_transition, chromosome_segregation,regulation_of_cell_cycle_G2_M_phase_transition),mitotic_cell_cycle_phase_transition)
+
+## Microtubule cytoskeleton
+negative_regulation_of_microtubule_depolymerization = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0007026"], split = "/"))
+regulation_of_microtubule_depolymerization = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0031114"], split = "/"))
+microtubule_cytoskeleton_organization_involved_in_mitosis = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:1902850"], split = "/"))
+
+Microtubule = union(c(negative_regulation_of_microtubule_depolymerization,regulation_of_microtubule_depolymerization),microtubule_cytoskeleton_organization_involved_in_mitosis)
+
+## Chromatin remodeling
+chromatin_remodeling = unlist(strsplit(ego_over_expressed_RNF_list_filt_unique@result$geneID[ego_over_expressed_RNF_list_filt_unique@result$ID == "GO:0006338"], split = "/"))
+```
+
+```{r}
+# Rename proteins that are annotated in mouse, but not in human
+DNA_damage_and_repair = replace(DNA_damage_and_repair, DNA_damage_and_repair == "Trp53", "Tp53")
+Cell_cycle = replace(Cell_cycle, Cell_cycle == "Trp53", "Tp53")
+chromatin_remodeling = replace(chromatin_remodeling, chromatin_remodeling == "H1f0","H1-0")
+chromatin_remodeling = replace(chromatin_remodeling, chromatin_remodeling == "H1f1","H1-1")
+```
+
+```{r}
+# Create matrix with over-expressed significant proteins
+mat_over_expressed_proteins_RNF = assay(dep_MinProb_imp_filt_unique)
+#[rownames(assay(dep_MinProb_imp_filt_unique)) %in% sig_over_expressed_proteins_RNF_name,]
+scaled_mat_over_expressed_proteins_RNF = t(apply(mat_over_expressed_proteins_RNF, 1, scale))
+colnames(scaled_mat_over_expressed_proteins_RNF) = colnames(mat_over_expressed_proteins_RNF)
+```
+
+```{r, fig.width=10, fig.height=10}
+heatmap_over_expressed_proteins_RNF_Cell_cycle_scaled = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][rownames(scaled_mat_over_expressed_proteins_RNF) %in% Cell_cycle,], name = "scaled log2 Protein Abundance", show_row_names = TRUE, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_over_expressed_proteins_RNF_Cell_cycle_scaled.pdf"), width = 10, height = 10)
+heatmap_over_expressed_proteins_RNF_Cell_cycle_scaled
+dev.off()
+```
+
+```{r}
+heatmap_over_expressed_proteins_RNF_Microtubule_scaled = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][rownames(scaled_mat_over_expressed_proteins_RNF) %in% Microtubule,], name = "log2 Protein Abundance", show_row_names = TRUE, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_over_expressed_proteins_RNF_Microtubule_scaled.pdf"), width = 10, height = 10)
+heatmap_over_expressed_proteins_RNF_Microtubule_scaled
+dev.off()
+```
+
+```{r}
+heatmap_over_expressed_proteins_RNF_chromating_remodeling_scaled = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][rownames(scaled_mat_over_expressed_proteins_RNF) %in% chromatin_remodeling,], name = "log2 Protein Abundance", show_row_names = TRUE, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_over_expressed_proteins_RNF_chromating_remodeling_scaled.pdf"), width = 10, height = 10)
+heatmap_over_expressed_proteins_RNF_chromating_remodeling_scaled
+dev.off()
+```
+
+```{r}
+heatmap_over_expressed_proteins_RNF_DNA_Damage_Repair_response_scaled = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][rownames(scaled_mat_over_expressed_proteins_RNF) %in% DNA_damage_and_repair,], name = "log2 Protein Abundance", show_row_names = TRUE, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_over_expressed_proteins_RNF_DNA_Damage_Repair_response_scaled.pdf"), width = 10, height = 10)
+heatmap_over_expressed_proteins_RNF_DNA_Damage_Repair_response_scaled
+dev.off()
+```
+
+```{r}
+non_4_pathways_proteins = setdiff(list_of_sig_overexpressed_proteins_RNF$name,c(Cell_cycle,Microtubule,chromatin_remodeling,DNA_damage_and_repair))
+heatmap_overexpressed_non_4_pathways_RNF144b = Heatmap(scaled_mat_over_expressed_proteins_RNF[,1:6][rownames(scaled_mat_over_expressed_proteins_RNF) %in% non_4_pathways_proteins,], name = "log2 Protein Abundance", show_row_names = TRUE, cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE)
+pdf(file = here("analysis","figures","Proteomics_heatmap_over_expressed_proteins_RNF144b_not_in_4_pathways_scaled.pdf"), width = 10, height = 10)
+heatmap_overexpressed_non_4_pathways_RNF144b
+dev.off()
+```
+
+## Analysis of CIN gene set
+
+```{r}
+# Load the Gene set
+GS_CIN <- getGmt(here("analysis","data","derived_data", "proteomics", "extdata", "MSigDb_mouse","CIN_MOUSE_SYMBOLS.Mm.gmt.txt"),  geneIdType=SymbolIdentifier())
+GS_hallmark <- getGmt(here("analysis","data","derived_data", "proteomics", "extdata", "MSigDb_mouse","mh.all.v2023.1.Mm.symbols.gmt.txt"),  geneIdType=SymbolIdentifier())
+GS_curated <- getGmt(here("analysis","data","derived_data", "proteomics", "extdata", "MSigDb_mouse","m2.cp.v2023.1.Mm.symbols.gmt.txt"),  geneIdType=SymbolIdentifier())
+gsc_CIN <- GeneSetCollection(c(GS_CIN,GS_hallmark,GS_curated))
+```
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+gsets.CIN <- geneIds(gsc_CIN)
+## Look for intersection between our significant genes
+tFA_genes = gsets.CIN$TOTAL_FUNCTIONAL_ANEUPLOIDY_ASSOCIATED_70_GENES
+CIN_genes = gsets.CIN$CIN_ASSOCIATED_29_GENES
+intersect(tFA_genes, sig_over_expressed_proteins_RNF_name)
+intersect(CIN_genes, sig_over_expressed_proteins_RNF_name)
+```
+
+```{r}
+temp = venn.diagram(
+	x = list(tFA_genes,sig_over_expressed_proteins_RNF_name),
+	category.names = c("CIN genes","Sig. over-expressed proteins"),
+	
+	# Circles
+	fill = c("#E2E2FA","#9E9EF2"),
+	alpha = c(0.7,0.7),
+	lwd = 2,
+	lty = "blank",
+	
+	# Numbers
+	cex = 2,
+	fontface = "bold",
+	fontfamily = "sans",
+	
+	#
+	cat.cex = 2,
+	cat.fontface = "bold",
+	cat.default.pos = "text",
+	cat.dist = c(0.06, 0.1),
+	# cat.fontfamily = "sans",
+	# rotation = 1,
+	# Remove line when label does not fit inside circle
+  ext.text = FALSE,
+	filename = NULL
+)
+```
+
+```{r}
+pdf(file = here("analysis","figures","Proteomics_Venn_diagram_CIN_intersect_RNF144B_over_expressed_proteins.pdf"), width = 10, height = 10)
+grid.draw(temp)
+dev.off()
+```
+
+### GSEA
+```{r}
+MinProb_filt_unique_RNF144B_df = mixed_imputation_MinProb_filt_unique_results
+MinProb_filt_unique_RNF144B_df$fcsign <- sign(MinProb_filt_unique_RNF144B_df$Rnf144b_vs_Control_ratio)
+MinProb_filt_unique_RNF144B_df$logP <- -log10(MinProb_filt_unique_RNF144B_df$Rnf144b_vs_Control_p.val)
+MinProb_filt_unique_RNF144B_df$metric <- MinProb_filt_unique_RNF144B_df$logP/MinProb_filt_unique_RNF144B_df$fcsign
+stats.MinProb_filt_unique_RNF144B <- MinProb_filt_unique_RNF144B_df$metric
+names(stats.MinProb_filt_unique_RNF144B) <- MinProb_filt_unique_RNF144B_df$name
+fgseares.MinProb_filt_unique_RNF144B <- fgsea(gsets.CIN, stats.MinProb_filt_unique_RNF144B, minSize=5, maxSize=300, nproc = 1)
+```
+
+```{r}
+# Exploration of significative Gene Set padj < 0.05
+intersect(unlist(fgseares.MinProb_filt_unique_RNF144B$leadingEdge[fgseares.MinProb_filt_unique_RNF144B$padj < 0.05]), sig_over_expressed_proteins_RNF_name)
+```
+
+
+```{r, fig.width=15}
+gsea_CIN_MinProb_filt_unique_RNF144B = plotEnrichment(gsets.CIN$TOTAL_FUNCTIONAL_ANEUPLOIDY_ASSOCIATED_70_GENES, stats.MinProb_filt_unique_RNF144B) +
+  theme(axis.text = element_text(size=16))
+```
+
+```{r}
+pdf(file = here("analysis","figures","Proteomics_GSEA_CIN_TOTAL_FUNCTIONAL_ANEUPLOIDY_ASSOCIATED_GENES.pdf"), width = 15, height = 10)
+gsea_CIN_MinProb_filt_unique_RNF144B
+dev.off()
+```
+
+#### Exploring the GSEA plotting
+```{r}
+gseaParam = 1
+ticksSize = 0.2
+rnk <- rank(-stats.MinProb_filt_unique_RNF144B)
+ord <- order(rnk)
+statsAdj <- stats.MinProb_filt_unique_RNF144B[ord]
+statsAdj <- sign(statsAdj) * (abs(statsAdj)^gseaParam)
+statsAdj <- statsAdj/max(abs(statsAdj))
+pathway <- unname(as.vector(na.omit(match(gsets.CIN$TOTAL_FUNCTIONAL_ANEUPLOIDY_ASSOCIATED_70_GENES, names(statsAdj)))))
+    pathway <- sort(pathway)
+    gseaRes <- calcGseaStat(statsAdj, selectedStats = pathway, 
+        returnAllExtremes = TRUE)
+    bottoms <- gseaRes$bottoms
+    tops <- gseaRes$tops
+    n <- length(statsAdj)
+    xs <- as.vector(rbind(pathway - 1, pathway))
+    ys <- as.vector(rbind(bottoms, tops))
+    toPlot <- data.frame(x = c(0, xs, n + 1), y = c(0, ys, 0))
+    diff <- (max(tops) - min(bottoms))/8
+    x = y = NULL
+    g <- ggplot(toPlot, aes(x = x, y = y)) + geom_point(color = "green", 
+        size = 0.1) + geom_hline(yintercept = max(tops), colour = "red", 
+        linetype = "dashed") + geom_hline(yintercept = min(bottoms), 
+        colour = "red", linetype = "dashed") + geom_hline(yintercept = 0, 
+        colour = "black") + geom_line(color = "green") + theme_bw() + 
+        geom_segment(data = data.frame(x = pathway), mapping = aes(x = x, 
+            y = -diff/2, xend = x, yend = diff/2), size = ticksSize) + 
+        theme(panel.border = element_blank(), panel.grid.minor = element_blank()) + 
+        labs(x = "rank", y = "enrichment score")
+    g
+```
+
+#### Adjust variables for GSEA plot
+```{r}
+options(digits = 3)
+enrichment.score.range = c(min(ys), max(ys))
+gsea.gene.set = "TOTAL_FUNCTIONAL_ANEUPLOIDY_ASSOCIATED_70_GENES"
+gsea.enrichment.score = fgseares.MinProb_filt_unique_RNF144B[fgseares.MinProb_filt_unique_RNF144B$pathway == gsea.gene.set,]$ES
+gsea.p.value = fgseares.MinProb_filt_unique_RNF144B[fgseares.MinProb_filt_unique_RNF144B$pathway == gsea.gene.set,]$pval
+gsea.fdr = fgseares.MinProb_filt_unique_RNF144B[fgseares.MinProb_filt_unique_RNF144B$pathway == gsea.gene.set,]$padj
+gsea.normalized.enrichment.score = fgseares.MinProb_filt_unique_RNF144B[fgseares.MinProb_filt_unique_RNF144B$pathway == gsea.gene.set,]$NES
+gsea.hit.indices = xs
+metric.range <- c(min(stats.MinProb_filt_unique_RNF144B), max(stats.MinProb_filt_unique_RNF144B))
+class.name = "shRNF144b expressed proteins"
+gsea.template = "a"
+gsea.metric = "None"
+```
+
+
+## Create GSEA plot
+```{r}
+pdf(file = here("analysis","figures","Proteomics_GSEA_FULL_CIN_TOTAL_FUNCTIONAL_ANEUPLOIDY_ASSOCIATED_GENES_CURATED_BG.pdf"), width = 5, height = 7)
+  # Save default for resetting
+  def.par <- par(no.readonly = TRUE)
+  
+  # Create a new device of appropriate size
+  #dev.new(width = 10, height = 3)
+  
+  # Create a division of the device
+  gsea.layout <- layout(matrix(c(1, 2, 3, 4)), heights = c(1.7, 0.5, 0.2, 2))
+  layout.show(gsea.layout)
+  
+  # Create plots
+  par(mar = c(0, 5, 2, 2))
+  plot(toPlot$x, toPlot$y, type = "l", col = "red", lwd = 1.5, xaxt = "n",
+       xaxs = "i", xlab = "", ylab = "Enrichment score (ES)",
+       ylim = enrichment.score.range,
+       main = list(gsea.gene.set, font = 1, cex = 1),
+       panel.first = {
+          abline(h = seq(round(enrichment.score.range[1], digits = 1),
+                         enrichment.score.range[2], 0.1),
+                 col = "gray95", lty = 2)
+         abline(h = 0, col = "gray50", lty = 2)
+       })
+  plot.coordinates <- par("usr")
+  if(gsea.enrichment.score < 0) {
+    text(length(stats.MinProb_filt_unique_RNF144B) * 0.01, plot.coordinates[3] * 0.98,
+         paste("Nominal p-value:", gsea.p.value, "\nFDR:", gsea.fdr, "\nES:",
+               gsea.enrichment.score, "\nNormalized ES:",
+               gsea.normalized.enrichment.score), adj = c(0, 0))
+  } else {
+    text(length(stats.MinProb_filt_unique_RNF144B) * 0.99, plot.coordinates[4] - ((plot.coordinates[4] - plot.coordinates[3]) * 0.03),
+         paste("Nominal p-value:", round(gsea.p.value,4), "\nFDR:", round(gsea.fdr,4), "\nES:",
+               round(gsea.enrichment.score,4), "\nNormalized ES:",
+               round(gsea.normalized.enrichment.score,4), "\n"), adj = c(1, 1))
+  }
+  
+  par(mar = c(0, 5, 0, 2))
+  plot(0, type = "n", xaxt = "n", xaxs = "i", xlab = "", yaxt = "n",
+       ylab = "", xlim = c(1, length(stats.MinProb_filt_unique_RNF144B)))
+  abline(v = gsea.hit.indices, lwd = 0.75)
+  
+  par(mar = c(0, 5, 0, 2))
+  rank.colors <- stats.MinProb_filt_unique_RNF144B[ord] - metric.range[1]
+  rank.colors <- rank.colors / (metric.range[2] - metric.range[1])
+  rank.colors <- ceiling(rank.colors * 255 + 1)
+  tryCatch({
+    rank.colors <- colorRampPalette(c("blue", "white", "red"))(256)[rank.colors]
+  }, error = function(e) {
+    stop("Please use the metric.range argument to provide a metric range that",
+         "includes all metric values")
+  })
+  # Use rle to prevent too many objects
+  rank.colors <- rle(rank.colors)
+  barplot(matrix(rank.colors$lengths), col = rank.colors$values, border = NA, horiz = TRUE, xaxt = "n", xlim = c(1, length(stats.MinProb_filt_unique_RNF144B)))
+  box()
+  text(length(stats.MinProb_filt_unique_RNF144B) / 2, 0.7,
+       labels = ifelse(!missing(class.name), class.name, gsea.template))
+  text(length(stats.MinProb_filt_unique_RNF144B) * 0.01, 0.7, "Overexpressed", adj = c(0, NA))
+  text(length(stats.MinProb_filt_unique_RNF144B) * 0.99, 0.7, "Underexpressed", adj = c(1, NA))
+  
+  par(mar = c(5, 5, 0, 2))
+  rank.metric <- rle(round(stats.MinProb_filt_unique_RNF144B[ord], digits = 2))
+  plot(stats.MinProb_filt_unique_RNF144B[ord], type = "n", xaxs = "i",
+	     xlab = "Rank in ordered gene list", xlim = c(0, length(stats.MinProb_filt_unique_RNF144B)),
+	     ylim = metric.range, yaxs = "i",
+	     ylab = if(gsea.metric == "None") {"Ranking metric"} else {gsea.metric},
+	     panel.first = abline(h = seq(metric.range[1] / 2,
+	                                  metric.range[2] - metric.range[1] / 4,
+	                                  metric.range[2] / 2), col = "gray95", lty = 2))
+
+  barplot(as.vector(rank.metric$values), col = "lightgrey", lwd = 0.1, xaxs = "i",
+       xlab = "Rank in ordered gene list", xlim = c(0, length(stats.MinProb_filt_unique_RNF144B)),
+       ylim = c(-1, 1), yaxs = "i", width = rank.metric$lengths, border = NA,
+       ylab = ifelse(gsea.metric == "None", "Ranking metric", gsea.metric), space = 0, add = TRUE)
+  box()
+  
+  # Reset to default
+  par(def.par)
+dev.off()
+```
+
+### Table from DEPs with transcriptomic values
+
+```{r}
+expression_values_DEP_CT_RNF = as.data.frame(mat_over_expressed_proteins_RNF) %>%
+	mutate(shCTRL_mean_log2_protein_abundance = rowMeans(across(starts_with("Control"))),
+				 shRNF144b_mean_log2_protein_abundance = rowMeans(across(starts_with("Rnf144b")))) %>%
+	rownames_to_column("name") %>%
+	dplyr::select(c(name,shCTRL_mean_log2_protein_abundance,shRNF144b_mean_log2_protein_abundance))
+unique_peptides_matrix = df_Rnf144b_analysis %>%
+	dplyr::select(c(Accession,unique_peptides)) %>%
+	dplyr::rename(ID = Accession)
+
+PROT_DEPs_df = read_xlsx(here("analysis","figures","TopTable_DEPs_RNF144b.xlsx")) %>%
+	left_join(expression_values_DEP_CT_RNF,by = join_by("name")) %>%
+	left_join(unique_peptides_matrix, by = join_by("ID")) %>%
+	dplyr::rename(Gene_name = name, Uniprot_ID = ID, log2FC_proteomics_rnf144b_vs_ctrl = log2FC, p_value_proteomics = pval) %>%
+	dplyr::select(c(Gene_name, Uniprot_ID,unique_peptides, shCTRL_mean_log2_protein_abundance,shRNF144b_mean_log2_protein_abundance,log2FC_proteomics_rnf144b_vs_ctrl,p_value_proteomics))
+	
+TRANS_ALL_GENES_df = read_xlsx(here("analysis","data","derived_data","transcriptomics","TopTable_RNF144b_all_genes.xlsx")) %>%
+	mutate(shCTRL_TMM_RNAseq = rowMeans(across(starts_with("shREN"))),
+				 shRNF144b_TMM_RNAseq = rowMeans(across(starts_with("shRNF")))) %>%
+	dplyr::select(c(ensembl_id,mgi_symbol,log2FC,FDR, shCTRL_TMM_RNAseq,shRNF144b_TMM_RNAseq)) %>%
+	dplyr::rename(Ensembl_ID = ensembl_id, Gene_name = mgi_symbol, log2FC_transcriptomics_rnf144b_vs_ctrl = log2FC, FDR_transcriptomics = FDR) %>%
+	dplyr::select(c(Ensembl_ID,Gene_name,shCTRL_TMM_RNAseq,shRNF144b_TMM_RNAseq,log2FC_transcriptomics_rnf144b_vs_ctrl,FDR_transcriptomics))
+
+PROT_DEPs_df_with_TRANS = PROT_DEPs_df %>%
+	left_join(TRANS_ALL_GENES_df, by = join_by("Gene_name")) %>%
+	dplyr::relocate(Ensembl_ID,.after = Uniprot_ID)
+write.xlsx(PROT_DEPs_df_with_TRANS, file = here("analysis","figures","TopTable_PROT_TRANS_DEPs_RNF144b.xlsx"))
+```
+
+
+### Comparison of logFC between Transcriptome and Proteome
+
+```{r}
+Ref_proteins_UNIPROT_ENSEMBL <- read.delim(here("analysis", "data", "derived_data","proteomics","extdata","uniprot_ids","Reference_prot_list_UNIPROT_ENSEMBL.txt"), sep = c("\t"), header = TRUE)
+```
+
+```{r}
+PROT_integrative_RNF = mixed_imputation_MinProb_filt_unique_results %>%
+	filter(ID %in% Ref_proteins_UNIPROT_ENSEMBL$From)
+PROT_integrative_RNF_merge <- merge(PROT_integrative_RNF, Ref_proteins_UNIPROT_ENSEMBL, by.x = "ID", by.y = "From", all.x = TRUE)
+PROT_integrative_RNF <- PROT_integrative_RNF_merge %>%
+	relocate(To, .after = ID)
+## I have checked and the duplicates that are detected as duplicates are the genes we are not interested in
+PROT_integrative_RNF <- PROT_integrative_RNF[!duplicated(PROT_integrative_RNF$ID),]
+```
+
+```{r}
+# Dataset with the significant proteins mapped to all the transcripts
+## Now, the df of transcripts with only ENSEMBL_ID and log2FC
+TRANS_ENSEMBL_ID_lfc_RNF <- tt.DESeq.sva.RNF_tb[,c("Ensembl_ID", "log2FoldChange")]
+TRANS_PROT_RNF_sigP <- merge(PROT_integrative_RNF, TRANS_ENSEMBL_ID_lfc_RNF, by.x = "To", by.y = "Ensembl_ID", all.x = TRUE)
+TRANS_PROT_RNF_sigP <- TRANS_PROT_RNF_sigP[!is.na(TRANS_PROT_RNF_sigP$log2FoldChange),]
+TRANS_PROT_RNF_sigP_plotting_subset <- TRANS_PROT_RNF_sigP[,c("To", "ID", "Rnf144b_vs_Control_ratio", "log2FoldChange")]
+colnames(TRANS_PROT_RNF_sigP_plotting_subset) <- c("ENSEMBL_ID", "UNIPROT", "logFC_PROT", "logFC_TRANS")
+```
+
+```{r}
+TRANS_integrative_RNF <- sigResults.RNF[sigResults.RNF$Ensembl_ID %in% Ref_proteins_UNIPROT_ENSEMBL$To,]
+TRANS_integrative_RNF_merge <- merge(TRANS_integrative_RNF, Ref_proteins_UNIPROT_ENSEMBL, by.x = "Ensembl_ID", by.y = "To", all.x = TRUE)
+TRANS_integrative_RNF <- TRANS_integrative_RNF_merge %>%
+	relocate(From, .after = Ensembl_ID)
+```
+
+```{r}
+PROT_ENSEMBL_ID_lfc_RNF_trial <- all_data_df[,c("Accession", "LOG2-FC...37")]
+TRANS_PROT_RNF_sigT_trial <- merge(TRANS_integrative_RNF, PROT_ENSEMBL_ID_lfc_RNF_trial, by.x = "From", by.y = "Accession", all.x = TRUE)
+TRANS_PROT_RNF_sigT_trial <- TRANS_PROT_RNF_sigT_trial[TRANS_PROT_RNF_sigT_trial$`LOG2-FC...37` != "NA" & TRANS_PROT_RNF_sigT_trial$`LOG2-FC...37` != "INF",]
+TRANS_PROT_RNF_sigT_trial$`LOG2-FC...37` <- as.numeric(TRANS_PROT_RNF_sigT_trial$`LOG2-FC...37`)
+TRANS_PROT_RNF_sigT_plotting_subset_trial <- TRANS_PROT_RNF_sigT_trial[,c("Ensembl_ID", "From", "log2FoldChange", "LOG2-FC...37")]
+colnames(TRANS_PROT_RNF_sigT_plotting_subset_trial) <- c("ENSEMBL_ID", "UNIPROT", "logFC_TRANS", "logFC_PROT")
+```
+
+```{r}
+# Dataset for the plotting
+TRANS_PROT_RNF_plot_dataset <- rbind(TRANS_PROT_RNF_sigP_plotting_subset, TRANS_PROT_RNF_sigT_plotting_subset_trial)
+TRANS_PROT_RNF_plot_dataset <- TRANS_PROT_RNF_plot_dataset[!duplicated(TRANS_PROT_RNF_plot_dataset$UNIPROT),]
+TRANS_PROT_RNF_plot_dataset$quadrant <- NA
+TRANS_PROT_RNF_plot_dataset$quadrant <- factor(TRANS_PROT_RNF_plot_dataset$quadrant, levels = 1:9)
+```
+
+```{r}
+for(protein in TRANS_PROT_RNF_plot_dataset$UNIPROT){
+	if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.585){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 1
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.585 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.585){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 2
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > 1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.585){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 3
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.585){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 4
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.585 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.585){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 5
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < 1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS > -1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.585 ){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 6
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -1 &  TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < -0.585 ){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 7
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -1 &  TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > -0.585 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT < 0.585 ){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 8
+	}else if(TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_TRANS < -1 & TRANS_PROT_RNF_plot_dataset[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein, ]$logFC_PROT > 0.585){
+		TRANS_PROT_RNF_plot_dataset$quadrant[TRANS_PROT_RNF_plot_dataset$UNIPROT == protein] <- 9
+	}
+}
+```
+
+```{r}
+cor.test(TRANS_PROT_RNF_plot_dataset$logFC_TRANS, TRANS_PROT_RNF_plot_dataset$logFC_PROT)
+```
+
+```{r}
+Fold_change_integrative_plot_RNF = ggplot(TRANS_PROT_RNF_plot_dataset, aes(x=logFC_PROT, y=logFC_TRANS, color = quadrant)) +
+	geom_vline(xintercept = c(-0.585, 0.585), linetype = "dashed") +
+	geom_hline(yintercept = c(-1, 1), linetype = "dashed") +
+	geom_point(alpha = 0.5, show.legend = FALSE) +
+	theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+	ylim(-3,3) + 
+	scale_color_manual(values = c("grey","grey","red","grey","grey","red","grey","grey","grey"))
+```
+
+```{r}
+pdf(file = here("analysis","figures","Fold_change_integrative_plot_RNF_unique_filt.pdf"), width = 10, height = 10)
+Fold_change_integrative_plot_RNF
+dev.off()
+```
